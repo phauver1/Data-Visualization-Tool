@@ -10,12 +10,21 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
 import pygame
 import seaborn as sns
+from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import KFold, StratifiedKFold
+
+try:
+    from scipy.cluster.hierarchy import dendrogram, linkage
+except Exception:  # pragma: no cover - optional dependency in some environments
+    dendrogram = None
+    linkage = None
 
 try:
     import tkinter as tk
@@ -154,6 +163,20 @@ PLOT_PARAM_OVERRIDES: Dict[str, Dict[str, List[Any]]] = {
         "oob_score": [True, False],
         "warm_start": [True, False],
     },
+    "dendrogram": {
+        "method": ["single", "complete", "average", "weighted", "centroid", "median", "ward"],
+        "metric": ["euclidean", "cityblock", "cosine", "chebyshev", "correlation"],
+        "orientation": ["top", "bottom", "left", "right"],
+        "truncate_mode": [None, "lastp", "level"],
+    },
+    "kmeans_cluster": {
+        "algorithm": ["lloyd", "elkan"],
+        "init": ["k-means++", "random"],
+    },
+    "gaussian_mixture": {
+        "covariance_type": ["full", "tied", "diag", "spherical"],
+        "init_params": ["kmeans", "k-means++", "random", "random_from_data"],
+    },
 }
 
 PLOT_DESCRIPTIONS = {
@@ -182,6 +205,9 @@ PLOT_DESCRIPTIONS = {
     "catplot": "Figure-level categorical plot with faceting.",
     "lmplot": "Figure-level regression plot with faceting.",
     "rf_regression": "Random Forest regression with stratified 5-fold CV and feature importances.",
+    "dendrogram": "Hierarchical clustering dendrogram from selected numeric columns.",
+    "kmeans_cluster": "KMeans clustering on one or two columns with grouped distribution/relationship plot.",
+    "gaussian_mixture": "Gaussian Mixture clustering on one or two columns with optional 2D 1-sigma contours.",
 }
 
 PARAM_DESCRIPTIONS = {
@@ -200,6 +226,7 @@ PARAM_DESCRIPTIONS = {
     "palette": "Color palette name or mapping.",
     "feature_columns": "Input feature columns for random forest regression.",
     "target_column": "Single output/target column for random forest regression.",
+    "data_columns": "One or two numeric input columns used for clustering plots.",
 }
 
 
@@ -234,6 +261,7 @@ class Relation:
     right_table: str
     right_col: str
     join_mode: str = "inner"
+    click_count: int = 0
 
 
 class ScrollPanel:
@@ -324,6 +352,60 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
         group="AI Analysis",
     )
 
+    specs["dendrogram"] = PlotSpec(
+        name="dendrogram",
+        description=PLOT_DESCRIPTIONS["dendrogram"],
+        required_slots=["feature_columns"],
+        column_slots=["feature_columns"],
+        multi_slots={"feature_columns"},
+        option_params=["method", "metric", "orientation", "truncate_mode", "p", "leaf_rotation", "leaf_font_size"],
+        function_name=None,
+        custom=True,
+        group="AI Analysis",
+    )
+
+    km_sig = inspect.signature(KMeans)
+    km_options: List[str] = []
+    for pname, param in km_sig.parameters.items():
+        if pname == "self":
+            continue
+        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+            continue
+        km_options.append(pname)
+
+    specs["kmeans_cluster"] = PlotSpec(
+        name="kmeans_cluster",
+        description=PLOT_DESCRIPTIONS["kmeans_cluster"],
+        required_slots=["data_columns"],
+        column_slots=["data_columns"],
+        multi_slots={"data_columns"},
+        option_params=km_options,
+        function_name=None,
+        custom=True,
+        group="AI Analysis",
+    )
+
+    gm_sig = inspect.signature(GaussianMixture)
+    gm_options: List[str] = []
+    for pname, param in gm_sig.parameters.items():
+        if pname == "self":
+            continue
+        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+            continue
+        gm_options.append(pname)
+
+    specs["gaussian_mixture"] = PlotSpec(
+        name="gaussian_mixture",
+        description=PLOT_DESCRIPTIONS["gaussian_mixture"],
+        required_slots=["data_columns"],
+        column_slots=["data_columns"],
+        multi_slots={"data_columns"},
+        option_params=gm_options,
+        function_name=None,
+        custom=True,
+        group="AI Analysis",
+    )
+
     return specs
 
 
@@ -361,6 +443,7 @@ class App:
         self.slot_values: Dict[str, Union[None, str, List[str]]] = {}
         self.option_values: Dict[str, Any] = {}
         self.active_slot: Optional[str] = None
+        self.last_multi_anchor: Optional[Tuple[str, str]] = None
 
         self.drag_item: Optional[DragItem] = None
         self.drag_pos = (0, 0)
@@ -388,6 +471,9 @@ class App:
         self.rel_line_layout: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
         self.rel_drag_start: Optional[Tuple[str, str]] = None
         self.rel_scroll_y = 0
+        self.rel_scroll_max = 0
+        self.rel_canvas_rect = pygame.Rect(0, 0, 0, 0)
+        self.rel_clear_btn = pygame.Rect(0, 0, 0, 0)
 
         self.update_layout()
 
@@ -412,7 +498,7 @@ class App:
 
         self.data_panel = ScrollPanel(self.data_rect.inflate(-10, -10))
         self.plot_panel = ScrollPanel(self.plot_type_rect.inflate(-10, -10))
-        self.builder_panel = ScrollPanel(pygame.Rect(self.builder_rect.x + 10, self.builder_rect.y + 74, self.builder_rect.w - 20, self.builder_rect.h - 84))
+        self.builder_panel = ScrollPanel(pygame.Rect(self.builder_rect.x + 10, self.builder_rect.y + 92, self.builder_rect.w - 20, self.builder_rect.h - 102))
         self.options_panel = ScrollPanel(pygame.Rect(self.options_rect.x + 10, self.options_rect.y + 40, self.options_rect.w - 20, self.options_rect.h - 50))
 
         self._build_menu_buttons()
@@ -447,14 +533,21 @@ class App:
             return None
         root = tk.Tk()
         root.withdraw()
+        root.attributes("-topmost", True)
+        root.update_idletasks()
+        root.lift()
+        root.focus_force()
         return root
 
     def open_files_picker(self) -> List[str]:
         if not filedialog or not tk:
             self.status = "tkinter is unavailable; cannot open file dialog."
             return []
+        pygame.event.pump()
+        pygame.event.set_grab(False)
         root = self._make_tk_root()
         paths = filedialog.askopenfilenames(
+            parent=root,
             title="Select data file(s)",
             filetypes=[
                 ("Data files", "*.csv *.xlsx *.xls *.db *.sqlite *.sqlite3"),
@@ -465,6 +558,7 @@ class App:
             ],
         )
         if root:
+            root.attributes("-topmost", False)
             root.destroy()
         return list(paths)
 
@@ -472,9 +566,12 @@ class App:
         if not filedialog or not tk:
             self.status = "tkinter is unavailable; cannot open save dialog."
             return None
+        pygame.event.pump()
+        pygame.event.set_grab(False)
         root = self._make_tk_root()
-        path = filedialog.asksaveasfilename(title=title, defaultextension=ext, filetypes=filetypes)
+        path = filedialog.asksaveasfilename(parent=root, title=title, defaultextension=ext, filetypes=filetypes)
         if root:
+            root.attributes("-topmost", False)
             root.destroy()
         return path or None
 
@@ -482,9 +579,12 @@ class App:
         if not filedialog or not tk:
             self.status = "tkinter is unavailable; cannot open file dialog."
             return None
+        pygame.event.pump()
+        pygame.event.set_grab(False)
         root = self._make_tk_root()
-        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        path = filedialog.askopenfilename(parent=root, title=title, filetypes=filetypes)
         if root:
+            root.attributes("-topmost", False)
             root.destroy()
         return path or None
 
@@ -686,6 +786,21 @@ class App:
     def option_default(self, plot_name: str, opt: str) -> Any:
         if plot_name == "rf_regression":
             return inspect.signature(RandomForestRegressor).parameters[opt].default
+        if plot_name == "kmeans_cluster":
+            return inspect.signature(KMeans).parameters[opt].default
+        if plot_name == "gaussian_mixture":
+            return inspect.signature(GaussianMixture).parameters[opt].default
+        if plot_name == "dendrogram":
+            defaults = {
+                "method": "ward",
+                "metric": "euclidean",
+                "orientation": "top",
+                "truncate_mode": None,
+                "p": 30,
+                "leaf_rotation": 0,
+                "leaf_font_size": 10,
+            }
+            return defaults.get(opt)
         return inspect.signature(getattr(sns, plot_name)).parameters[opt].default
 
     def close_menu(self):
@@ -706,11 +821,69 @@ class App:
             return "", value
         return value.split("::", 1)
 
+    def is_column_selected_in_active_slot(self, table: str, col: str) -> bool:
+        spec = self.current_spec()
+        if not spec or not self.active_slot:
+            return False
+        encoded = self.encode_col(table, col)
+        val = self.slot_values.get(self.active_slot)
+        if isinstance(val, list):
+            return encoded in val
+        return isinstance(val, str) and val == encoded
+
+    def get_related_column_set(self) -> Set[Tuple[str, str]]:
+        related: Set[Tuple[str, str]] = set()
+        for rel in self.relationships:
+            related.add((rel.left_table, rel.left_col))
+            related.add((rel.right_table, rel.right_col))
+        return related
+
+    def handle_multi_slot_column_click(self, slot: str, table: str, col: str, ctrl: bool, shift: bool):
+        spec = self.current_spec()
+        if not spec:
+            return
+        encoded = self.encode_col(table, col)
+        existing = list(self.slot_values.get(slot)) if isinstance(self.slot_values.get(slot), list) else []
+
+        if shift and self.last_multi_anchor and self.last_multi_anchor[0] == table:
+            cols = [str(c) for c in self.dataframes.get(table, pd.DataFrame()).columns.tolist()]
+            if col in cols and self.last_multi_anchor[1] in cols:
+                i0 = cols.index(self.last_multi_anchor[1])
+                i1 = cols.index(col)
+                lo, hi = min(i0, i1), max(i0, i1)
+                range_enc = [self.encode_col(table, c) for c in cols[lo : hi + 1]]
+                if ctrl or encoded in existing:
+                    existing = [e for e in existing if e not in range_enc]
+                else:
+                    for e in range_enc:
+                        if e not in existing:
+                            existing.append(e)
+                self.slot_values[slot] = existing
+                self.chart_surface = None
+                self.status = f"Updated range selection for {slot}"
+                self.last_multi_anchor = (table, col)
+                return
+
+        if ctrl:
+            if encoded in existing:
+                existing.remove(encoded)
+            else:
+                existing.append(encoded)
+            self.slot_values[slot] = existing
+            self.status = f"Toggled {table}.{col} in {slot}"
+        else:
+            self.slot_values[slot] = [encoded]
+            self.status = f"Selected {table}.{col} for {slot}"
+
+        self.last_multi_anchor = (table, col)
+        self.chart_surface = None
+
     def clear_plot_state(self):
         spec = self.current_spec()
         self.slot_values = {}
         self.option_values = {}
         self.active_slot = None
+        self.last_multi_anchor = None
         if not spec:
             return
         for s in spec.column_slots:
@@ -762,6 +935,7 @@ class App:
 
         prev_clip = self.screen.get_clip()
         self.screen.set_clip(viewport)
+        spec = self.current_spec()
 
         for table, df in self.dataframes.items():
             h_rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, row_h)
@@ -778,6 +952,8 @@ class App:
                     c_rect = pygame.Rect(viewport.x + 18, y, viewport.w - 28, col_h)
                     if viewport.colliderect(c_rect):
                         pygame.draw.rect(self.screen, (70, 78, 92), c_rect, border_radius=5)
+                        if spec and self.active_slot and self.is_column_selected_in_active_slot(table, str(col)):
+                            pygame.draw.rect(self.screen, ACCENT, c_rect, width=2, border_radius=5)
                         c_text = self.clip_text(str(col), c_rect.w - 10, self.font_sm)
                         self.draw_text(c_text, (c_rect.x + 6, c_rect.y + 3), font=self.font_sm)
                     self.data_layout.append((c_rect, "column", table, str(col)))
@@ -827,6 +1003,8 @@ class App:
                 if viewport.colliderect(p_rect):
                     fill = (61, 91, 133) if plot_name == self.selected_plot else (58, 66, 82)
                     pygame.draw.rect(self.screen, fill, p_rect, border_radius=6)
+                    if plot_name == self.selected_plot:
+                        pygame.draw.rect(self.screen, ACCENT, p_rect, width=2, border_radius=6)
                     self.draw_text(plot_name, (p_rect.x + 8, p_rect.y + 7), font=self.font_sm)
                 self.plot_layout.append((p_rect, "plot", plot_name))
                 y += item_h + 5
@@ -854,6 +1032,7 @@ class App:
 
         self.draw_text(self.clip_text(spec.description, self.builder_rect.w - 24, self.font_sm), (self.builder_rect.x + 12, header_y), MUTED, self.font_sm)
         self.draw_text("Click an input row, then click/drag columns from Data panel.", (self.builder_rect.x + 12, header_y + 20), MUTED, self.font_sm)
+        self.draw_text("Ctrl=toggle multi columns, Shift=range select/deselect.", (self.builder_rect.x + 12, header_y + 38), MUTED, self.font_sm)
 
         viewport = self.builder_panel.rect
         pygame.draw.rect(self.screen, PANEL_ALT, viewport, border_radius=6)
@@ -928,8 +1107,9 @@ class App:
             r = pygame.Rect(viewport.x + 6, y, viewport.w - 12, 30)
             if viewport.colliderect(r):
                 pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=6)
-                pygame.draw.rect(self.screen, (120, 130, 150), r, width=1, border_radius=6)
                 val = self.option_values.get(opt)
+                border_col = ACCENT if val is not None else (120, 130, 150)
+                pygame.draw.rect(self.screen, border_col, r, width=1, border_radius=6)
                 shown = "(unset)" if val is None else str(val)
                 txt = f"{opt}: {shown}"
                 self.draw_text(self.clip_text(txt, r.w - 10, self.font_sm), (r.x + 8, r.y + 7), font=self.font_sm)
@@ -1042,10 +1222,41 @@ class App:
         return False
 
     def cycle_join_mode(self, idx: int):
+        if idx < 0 or idx >= len(self.relationships):
+            return
         r = self.relationships[idx]
+        r.click_count += 1
+        if r.click_count > len(REL_JOIN_ORDER):
+            removed = self.relationships.pop(idx)
+            self.status = (
+                f"Removed relationship: {removed.left_table}.{removed.left_col} <-> "
+                f"{removed.right_table}.{removed.right_col}"
+            )
+            return
         current = REL_JOIN_ORDER.index(r.join_mode) if r.join_mode in REL_JOIN_ORDER else 0
         r.join_mode = REL_JOIN_ORDER[(current + 1) % len(REL_JOIN_ORDER)]
         self.status = f"Relationship join mode changed to {r.join_mode}"
+
+    def draw_arrow_line(self, start: Tuple[int, int], end: Tuple[int, int], color: Tuple[int, int, int], width: int = 3):
+        pygame.draw.line(self.screen, color, start, end, width)
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.hypot(dx, dy)
+        if length < 2:
+            return
+        ux, uy = dx / length, dy / length
+        arrow_len = 10
+        arrow_w = 6
+        tip = end
+        left = (
+            int(end[0] - arrow_len * ux + arrow_w * uy),
+            int(end[1] - arrow_len * uy - arrow_w * ux),
+        )
+        right = (
+            int(end[0] - arrow_len * ux - arrow_w * uy),
+            int(end[1] - arrow_len * uy + arrow_w * ux),
+        )
+        pygame.draw.polygon(self.screen, color, [tip, left, right])
 
     def point_to_segment_distance(self, p: Tuple[int, int], a: Tuple[int, int], b: Tuple[int, int]) -> float:
         ax, ay = a
@@ -1077,9 +1288,12 @@ class App:
         pygame.draw.rect(self.screen, (255, 255, 255), self.rel_modal_rect, width=1, border_radius=12)
 
         self.draw_text("Relationships Editor (Esc to close)", (self.rel_modal_rect.x + 14, self.rel_modal_rect.y + 12), font=self.font_lg)
+        self.rel_clear_btn = pygame.Rect(self.rel_modal_rect.x + 390, self.rel_modal_rect.y + 12, 150, 28)
+        self.draw_button(self.rel_clear_btn, "Clear Relationships", BAD)
 
         canvas = self.rel_modal_rect.inflate(-20, -70)
         canvas.y += 30
+        self.rel_canvas_rect = canvas
         pygame.draw.rect(self.screen, PANEL_ALT, canvas, border_radius=8)
 
         # Compute table boxes on a grid and clip all content to canvas to avoid spill-over.
@@ -1093,8 +1307,13 @@ class App:
         tables = list(self.dataframes.keys())
         cols = max(1, min(4, len(tables)))
         card_w = max(220, (canvas.w - (cols + 1) * 14) // cols)
+        rows = max(1, math.ceil(max(1, len(tables)) / cols))
+        content_h = rows * 260 + 20
+        self.rel_scroll_max = max(0, content_h - canvas.h)
+        self.rel_scroll_y = max(0, min(self.rel_scroll_y, self.rel_scroll_max))
         x0 = canvas.x + 14
         y0 = canvas.y + 14 - self.rel_scroll_y
+        related_cols = self.get_related_column_set()
 
         for idx, table in enumerate(tables):
             c = idx % cols
@@ -1113,6 +1332,8 @@ class App:
             for i, col in enumerate(self.dataframes[table].columns[:max_rows]):
                 cr = pygame.Rect(box.x + 6, col_y, box.w - 12, 20)
                 pygame.draw.rect(self.screen, (72, 82, 100), cr, border_radius=4)
+                if (table, str(col)) in related_cols:
+                    pygame.draw.rect(self.screen, ACCENT, cr, width=2, border_radius=4)
                 self.draw_text(self.clip_text(str(col), cr.w - 10, self.font_sm), (cr.x + 5, cr.y + 2), font=self.font_sm)
                 self.rel_column_boxes.append((cr, table, str(col)))
                 col_y += 23
@@ -1126,7 +1347,7 @@ class App:
             if not a or not b:
                 continue
             color = REL_JOIN_COLORS.get(rel.join_mode, (200, 200, 200))
-            pygame.draw.line(self.screen, color, a, b, 3)
+            self.draw_arrow_line(a, b, color, 3)
             self.rel_line_layout.append((a, b, i))
 
         # Draw relationship drag preview line.
@@ -1145,7 +1366,7 @@ class App:
         y = legend.y + 32
         for mode in REL_JOIN_ORDER:
             color = REL_JOIN_COLORS[mode]
-            pygame.draw.line(self.screen, color, (legend.x + 12, y + 7), (legend.x + 42, y + 7), 3)
+            self.draw_arrow_line((legend.x + 12, y + 7), (legend.x + 42, y + 7), color, 3)
             self.draw_text(mode, (legend.x + 50, y), font=self.font_sm)
             y += 20
 
@@ -1389,6 +1610,151 @@ class App:
         plt.close(fig)
         self.status = "Random forest plot generated successfully."
 
+    def _resolve_slot_columns(self, merged_df: pd.DataFrame, slot_name: str) -> List[str]:
+        raw = self.slot_values.get(slot_name)
+        values = raw if isinstance(raw, list) else ([raw] if isinstance(raw, str) else [])
+        cols: List[str] = []
+        for v in values:
+            t, c = self.decode_col(v)
+            cname = f"{t}.{c}" if t else c
+            if cname in merged_df.columns:
+                cols.append(cname)
+        return cols
+
+    def _calculate_dendrogram(self, merged_df: pd.DataFrame):
+        if dendrogram is None or linkage is None:
+            self.status = "SciPy is required for dendrogram plotting but is unavailable."
+            return
+        cols = self._resolve_slot_columns(merged_df, "feature_columns")
+        if len(cols) < 2:
+            self.status = "Dendrogram requires at least two feature columns."
+            return
+
+        data = merged_df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(data) < 2:
+            self.status = "Dendrogram requires at least two complete numeric rows."
+            return
+
+        method = self.option_values.get("method") or "ward"
+        metric = self.option_values.get("metric") or "euclidean"
+        orientation = self.option_values.get("orientation") or "top"
+        truncate_mode = self.option_values.get("truncate_mode")
+        p = self.option_values.get("p")
+        leaf_rotation = self.option_values.get("leaf_rotation")
+        leaf_font_size = self.option_values.get("leaf_font_size")
+
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        Z = linkage(data.values, method=method, metric=metric)
+        dendrogram(
+            Z,
+            ax=ax,
+            orientation=orientation,
+            truncate_mode=truncate_mode,
+            p=p if isinstance(p, int) else None,
+            leaf_rotation=leaf_rotation if leaf_rotation is not None else 0,
+            leaf_font_size=leaf_font_size if leaf_font_size is not None else 9,
+            no_labels=True,
+        )
+        ax.set_title("Dendrogram")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "Dendrogram generated successfully."
+
+    def _calculate_kmeans_cluster(self, merged_df: pd.DataFrame):
+        cols = self._resolve_slot_columns(merged_df, "data_columns")
+        if len(cols) < 1 or len(cols) > 2:
+            self.status = "KMeans requires one or two data_columns."
+            return
+
+        data = merged_df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(data) < 2:
+            self.status = "KMeans requires complete numeric data."
+            return
+
+        model_kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+        model = KMeans(**model_kwargs)
+        labels = model.fit_predict(data.values)
+
+        plot_df = data.copy()
+        plot_df["_group"] = labels.astype(str)
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        if len(cols) == 1:
+            sns.histplot(data=plot_df, x=cols[0], hue="_group", common_norm=False, element="step", ax=ax)
+        else:
+            sns.scatterplot(data=plot_df, x=cols[0], y=cols[1], hue="_group", ax=ax)
+        ax.set_title("KMeans Clusters")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "KMeans plot generated successfully."
+
+    def _gmm_covariance_matrix(self, model: GaussianMixture, component_idx: int) -> np.ndarray:
+        cov_type = model.covariance_type
+        covs = model.covariances_
+        if cov_type == "full":
+            return covs[component_idx]
+        if cov_type == "tied":
+            return covs
+        if cov_type == "diag":
+            return np.diag(covs[component_idx])
+        if cov_type == "spherical":
+            return np.eye(model.means_.shape[1]) * covs[component_idx]
+        return np.eye(model.means_.shape[1])
+
+    def _calculate_gaussian_mixture(self, merged_df: pd.DataFrame):
+        cols = self._resolve_slot_columns(merged_df, "data_columns")
+        if len(cols) < 1 or len(cols) > 2:
+            self.status = "Gaussian mixture requires one or two data_columns."
+            return
+
+        data = merged_df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(data) < 2:
+            self.status = "Gaussian mixture requires complete numeric data."
+            return
+
+        model_kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+        model = GaussianMixture(**model_kwargs)
+        labels = model.fit_predict(data.values)
+
+        plot_df = data.copy()
+        plot_df["_group"] = labels.astype(str)
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        if len(cols) == 1:
+            sns.histplot(data=plot_df, x=cols[0], hue="_group", common_norm=False, element="step", ax=ax)
+        else:
+            sns.scatterplot(data=plot_df, x=cols[0], y=cols[1], hue="_group", ax=ax)
+            for i in range(model.n_components):
+                cov = self._gmm_covariance_matrix(model, i)
+                if cov.shape != (2, 2):
+                    continue
+                vals, vecs = np.linalg.eigh(cov)
+                vals = np.clip(vals, 1e-9, None)
+                order = vals.argsort()[::-1]
+                vals, vecs = vals[order], vecs[:, order]
+                angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+                width, height = 2.0 * np.sqrt(vals[0]), 2.0 * np.sqrt(vals[1])
+                e = Ellipse(
+                    xy=(model.means_[i, 0], model.means_[i, 1]),
+                    width=width,
+                    height=height,
+                    angle=angle,
+                    fill=False,
+                    linestyle=":",
+                    linewidth=1.8,
+                    edgecolor="black",
+                    alpha=0.8,
+                )
+                ax.add_patch(e)
+        ax.set_title("Gaussian Mixture Clusters")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "Gaussian mixture plot generated successfully."
+
     def calculate_plot(self):
         spec = self.current_spec()
         if not spec:
@@ -1408,9 +1774,19 @@ class App:
             return
 
         try:
-            if spec.custom and spec.name == "rf_regression":
-                self._calculate_rf_regression(merged_df)
-                return
+            if spec.custom:
+                if spec.name == "rf_regression":
+                    self._calculate_rf_regression(merged_df)
+                    return
+                if spec.name == "dendrogram":
+                    self._calculate_dendrogram(merged_df)
+                    return
+                if spec.name == "kmeans_cluster":
+                    self._calculate_kmeans_cluster(merged_df)
+                    return
+                if spec.name == "gaussian_mixture":
+                    self._calculate_gaussian_mixture(merged_df)
+                    return
 
             kwargs = self._collect_seaborn_kwargs(spec, merged_df)
             if kwargs is None:
@@ -1543,6 +1919,11 @@ class App:
 
     def handle_relationship_mouse_down(self, pos: Tuple[int, int], button: int):
         if button == 1:
+            if self.rel_clear_btn.collidepoint(pos):
+                self.relationships = []
+                self.status = "Cleared all relationships."
+                return
+
             # Click line to cycle join mode.
             for a, b, idx in self.rel_line_layout:
                 if self.point_to_segment_distance(pos, a, b) <= 6:
@@ -1560,10 +1941,10 @@ class App:
                 self.rel_editor_open = False
                 self.rel_drag_start = None
 
-        if button in (4, 5) and self.rel_modal_rect.collidepoint(pos):
+        if button in (4, 5) and self.rel_canvas_rect.collidepoint(pos):
             dy = 1 if button == 4 else -1
             self.rel_scroll_y -= dy * 30
-            self.rel_scroll_y = max(0, self.rel_scroll_y)
+            self.rel_scroll_y = max(0, min(self.rel_scroll_y, self.rel_scroll_max))
 
     def handle_relationship_mouse_up(self, pos: Tuple[int, int], button: int):
         if button != 1 or not self.rel_drag_start:
@@ -1620,6 +2001,8 @@ class App:
             if spec:
                 for slot, rect in self.slot_layout.items():
                     if rect.collidepoint(pos):
+                        if self.active_slot != slot:
+                            self.last_multi_anchor = None
                         self.active_slot = slot
                         self.status = f"Active input: {slot}"
                         return
@@ -1642,8 +2025,14 @@ class App:
                         self.table_collapsed[table] = not self.table_collapsed.get(table, False)
                         return
                     if kind == "column":
-                        if spec and self.active_slot and self.active_slot not in spec.multi_slots:
-                            self.assign_columns_to_slot(self.active_slot, table, [col])
+                        if spec and self.active_slot:
+                            mods = pygame.key.get_mods()
+                            ctrl = bool(mods & pygame.KMOD_CTRL)
+                            shift = bool(mods & pygame.KMOD_SHIFT)
+                            if self.active_slot in spec.multi_slots:
+                                self.handle_multi_slot_column_click(self.active_slot, table, col, ctrl=ctrl, shift=shift)
+                            else:
+                                self.assign_columns_to_slot(self.active_slot, table, [col])
                         else:
                             self.drag_item = DragItem(kind="column", value=col, table=table, values=[col])
                             self.drag_pos = pos
