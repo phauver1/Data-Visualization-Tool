@@ -1,7 +1,7 @@
 import os
 import sqlite3
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Union
 
 import matplotlib
 matplotlib.use("Agg")
@@ -48,14 +48,28 @@ PLOT_SPECS = {
     "swarmplot": ["x", "y", "hue"],
     "pointplot": ["x", "y", "hue"],
     "kdeplot": ["x", "y", "hue"],
+    "jointplot": ["x", "y", "hue"],
+    "pairplot": ["vars", "hue"],
 }
+
+MULTI_VALUE_SLOTS = {
+    "pairplot": {"vars"},
+}
+
+STYLE_OPTION_SLOTS = {
+    "scatterplot": {"style"},
+    "lineplot": {"style"},
+}
+
+STYLE_CHOICES = ["darkgrid", "whitegrid", "dark", "white", "ticks"]
 
 
 @dataclass
 class DragItem:
-    kind: str  # "plot" or "column"
+    kind: str  # "column"
     value: str
     table: Optional[str] = None
+    values: List[str] = field(default_factory=list)
 
 
 class ScrollPanel:
@@ -102,12 +116,18 @@ class App:
         self.plot_layout: List[Tuple[pygame.Rect, str]] = []
 
         self.selected_plot: Optional[str] = None
-        self.slot_values: Dict[str, Optional[str]] = {}
+        self.slot_values: Dict[str, Union[None, str, List[str]]] = {}
         self.selected_table: Optional[str] = None
         self.slot_layout: Dict[str, pygame.Rect] = {}
+        self.active_slot: Optional[str] = None
 
         self.drag_item: Optional[DragItem] = None
         self.drag_pos = (0, 0)
+        self.plot_drop_rect = pygame.Rect(0, 0, 0, 0)
+
+        self.style_popup_slot: Optional[str] = None
+        self.style_popup_rect: Optional[pygame.Rect] = None
+        self.style_option_layout: List[Tuple[pygame.Rect, str]] = []
 
         self.chart_surface: Optional[pygame.Surface] = None
         self.status = "Load a CSV, Excel, or SQLite file to begin."
@@ -175,10 +195,61 @@ class App:
         self.selected_table = None
         self.selected_plot = None
         self.slot_values = {}
+        self.active_slot = None
+        self.close_style_popup()
         self.chart_surface = None
 
         table_count = len(new_data)
         self.status = f"Loaded {table_count} table(s) from {os.path.basename(path)}"
+
+    def is_multi_slot(self, plot_name: str, slot_name: str) -> bool:
+        return slot_name in MULTI_VALUE_SLOTS.get(plot_name, set())
+
+    def is_style_option_slot(self, plot_name: str, slot_name: str) -> bool:
+        return slot_name in STYLE_OPTION_SLOTS.get(plot_name, set())
+
+    def select_plot(self, plot_name: str):
+        self.selected_plot = plot_name
+        self.slot_values = {}
+        self.active_slot = None
+        for slot in PLOT_SPECS[plot_name]:
+            self.slot_values[slot] = [] if self.is_multi_slot(plot_name, slot) else None
+        self.chart_surface = None
+        self.close_style_popup()
+        self.status = f"Selected plot type: {self.selected_plot}"
+
+    def close_style_popup(self):
+        self.style_popup_slot = None
+        self.style_popup_rect = None
+        self.style_option_layout = []
+
+    def assign_columns_to_slot(self, slot: str, table: str, columns: List[str]):
+        if not self.selected_plot:
+            return
+        if self.is_style_option_slot(self.selected_plot, slot):
+            self.status = f"{slot} is an option slot; click it to pick a style."
+            return
+        if not columns:
+            return
+        if self.selected_table is None:
+            self.selected_table = table
+        if self.selected_table != table:
+            self.status = f"All slots must use {self.selected_table}; dropped from {table}."
+            return
+
+        if self.is_multi_slot(self.selected_plot, slot):
+            existing = self.slot_values.get(slot)
+            merged = list(existing) if isinstance(existing, list) else []
+            for c in columns:
+                if c not in merged:
+                    merged.append(c)
+            self.slot_values[slot] = merged
+            self.status = f"Assigned {len(columns)} column(s) to {slot}"
+        else:
+            self.slot_values[slot] = columns[0]
+            self.status = f"Assigned {columns[0]} to {slot}"
+
+        self.chart_surface = None
 
     # ------------------------------
     # Rendering helpers
@@ -292,7 +363,7 @@ class App:
 
         drop_plot = pygame.Rect(self.common_rect.x + 16, self.common_rect.y + 46, self.common_rect.w - 32, 52)
         pygame.draw.rect(self.screen, (50, 80, 115), drop_plot, border_radius=8)
-        label = self.selected_plot if self.selected_plot else "Drag plot type here"
+        label = self.selected_plot if self.selected_plot else "Click a plot type to begin"
         self.draw_text(label, (drop_plot.x + 12, drop_plot.y + 15))
 
         table_msg = f"Table: {self.selected_table}" if self.selected_table else "Table: (unset)"
@@ -304,14 +375,56 @@ class App:
             for arg in args:
                 s_rect = pygame.Rect(self.common_rect.x + 16, y, self.common_rect.w - 32, 42)
                 pygame.draw.rect(self.screen, (66, 72, 88), s_rect, border_radius=8)
-                pygame.draw.rect(self.screen, (120, 130, 150), s_rect, width=1, border_radius=8)
+                border_col = ACCENT if arg == self.active_slot else (120, 130, 150)
+                pygame.draw.rect(self.screen, border_col, s_rect, width=1, border_radius=8)
                 value = self.slot_values.get(arg)
-                text = f"{arg.upper()}: {value}" if value else f"{arg.upper()}: [drop column]"
+                if self.is_style_option_slot(self.selected_plot, arg):
+                    text = f"{arg.upper()}: {value}" if value else f"{arg.upper()}: [click to choose]"
+                elif self.is_multi_slot(self.selected_plot, arg):
+                    if isinstance(value, list) and value:
+                        text = f"{arg.upper()}: {', '.join(value)}"
+                    else:
+                        text = f"{arg.upper()}: [drag one or more columns]"
+                else:
+                    text = f"{arg.upper()}: {value}" if value else f"{arg.upper()}: [drop column]"
                 self.draw_text(self.clip_text(text, s_rect.w - 16, self.font_sm), (s_rect.x + 10, s_rect.y + 11), font=self.font_sm)
                 self.slot_layout[arg] = s_rect
                 y += 50
 
         self.plot_drop_rect = drop_plot
+
+    def draw_style_popup(self):
+        if not self.style_popup_slot or not self.selected_plot:
+            return
+
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((5, 8, 14, 150))
+        self.screen.blit(overlay, (0, 0))
+
+        popup_w = 360
+        popup_h = 280
+        popup = pygame.Rect(
+            self.common_rect.centerx - popup_w // 2,
+            self.common_rect.centery - popup_h // 2,
+            popup_w,
+            popup_h,
+        )
+        self.style_popup_rect = popup
+
+        pygame.draw.rect(self.screen, PANEL, popup, border_radius=10)
+        pygame.draw.rect(self.screen, (255, 255, 255), popup, width=1, border_radius=10)
+        self.draw_text(f"Select {self.style_popup_slot} style", (popup.x + 14, popup.y + 12), font=self.font_lg)
+
+        self.style_option_layout = []
+        y = popup.y + 56
+        for opt in STYLE_CHOICES:
+            r = pygame.Rect(popup.x + 14, y, popup.w - 28, 34)
+            selected = self.slot_values.get(self.style_popup_slot) == opt
+            fill = (61, 91, 133) if selected else (58, 66, 82)
+            pygame.draw.rect(self.screen, fill, r, border_radius=6)
+            self.draw_text(opt, (r.x + 10, r.y + 8), font=self.font_sm)
+            self.style_option_layout.append((r, opt))
+            y += 40
 
     def draw_chart_area(self):
         pygame.draw.rect(self.screen, PANEL, self.chart_rect, border_radius=10)
@@ -337,7 +450,11 @@ class App:
     def draw_dragging(self):
         if not self.drag_item:
             return
-        label = self.drag_item.value if self.drag_item.kind == "plot" else f"{self.drag_item.table}.{self.drag_item.value}"
+        cols = self.drag_item.values if self.drag_item.values else [self.drag_item.value]
+        if len(cols) > 1:
+            label = f"{self.drag_item.table}: {len(cols)} columns"
+        else:
+            label = f"{self.drag_item.table}.{cols[0]}"
         txt = self.font.render(label, True, (255, 255, 255))
         r = txt.get_rect()
         r.topleft = (self.drag_pos[0] + 10, self.drag_pos[1] + 8)
@@ -363,30 +480,51 @@ class App:
 
         args = PLOT_SPECS[self.selected_plot]
         required = ["x"] if self.selected_plot in {"countplot", "histplot"} else ["x", "y"]
+        if self.selected_plot == "pairplot":
+            required = ["vars"]
         for r in required:
-            if not self.slot_values.get(r):
+            v = self.slot_values.get(r)
+            if not v:
                 self.status = f"Missing required slot: {r}"
                 return
 
         plot_kwargs = {}
         for a in args:
-            col = self.slot_values.get(a)
-            if col:
-                if col not in df.columns:
-                    self.status = f"Column {col} not found in table {self.selected_table}"
+            if self.is_style_option_slot(self.selected_plot, a):
+                continue
+            slot_val = self.slot_values.get(a)
+            if not slot_val:
+                continue
+            if isinstance(slot_val, list):
+                missing = [c for c in slot_val if c not in df.columns]
+                if missing:
+                    self.status = f"Missing column(s) in {self.selected_table}: {', '.join(missing)}"
                     return
-                plot_kwargs[a] = col
+                plot_kwargs[a] = slot_val
+            else:
+                if slot_val not in df.columns:
+                    self.status = f"Column {slot_val} not found in table {self.selected_table}"
+                    return
+                plot_kwargs[a] = slot_val
 
         try:
             plt.close("all")
-            fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
-            sns.set_style("whitegrid")
+            style_value = self.slot_values.get("style")
+            sns.set_style(style_value if isinstance(style_value, str) else "whitegrid")
 
-            plot_fn = getattr(sns, self.selected_plot)
-            plot_fn(data=df, ax=ax, **plot_kwargs)
-
-            ax.set_title(f"{self.selected_plot} ({self.selected_table})")
-            fig.tight_layout()
+            if self.selected_plot in {"jointplot", "pairplot"}:
+                plot_fn = getattr(sns, self.selected_plot)
+                grid = plot_fn(data=df, **plot_kwargs)
+                fig = grid.fig
+                fig.set_size_inches(8, 3.2)
+                fig.suptitle(f"{self.selected_plot} ({self.selected_table})")
+                fig.tight_layout()
+            else:
+                fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+                plot_fn = getattr(sns, self.selected_plot)
+                plot_fn(data=df, ax=ax, **plot_kwargs)
+                ax.set_title(f"{self.selected_plot} ({self.selected_table})")
+                fig.tight_layout()
 
             canvas = fig.canvas
             canvas.draw()
@@ -403,6 +541,8 @@ class App:
         self.selected_plot = None
         self.slot_values = {}
         self.selected_table = None
+        self.active_slot = None
+        self.close_style_popup()
         self.chart_surface = None
         self.status = "Cleared current builder state."
 
@@ -411,6 +551,18 @@ class App:
     # ------------------------------
     def handle_mouse_down(self, pos: Tuple[int, int], button: int):
         if button == 1:
+            if self.style_popup_slot:
+                for rect, opt in self.style_option_layout:
+                    if rect.collidepoint(pos):
+                        self.slot_values[self.style_popup_slot] = opt
+                        self.close_style_popup()
+                        self.chart_surface = None
+                        self.status = f"Selected style: {opt}"
+                        return
+                if self.style_popup_rect and not self.style_popup_rect.collidepoint(pos):
+                    self.close_style_popup()
+                return
+
             if self.load_btn.collidepoint(pos):
                 path = self.open_file_picker()
                 if path:
@@ -425,20 +577,32 @@ class App:
                 self.clear_selection()
                 return
 
+            if self.selected_plot:
+                for arg, rect in self.slot_layout.items():
+                    if rect.collidepoint(pos):
+                        if self.is_style_option_slot(self.selected_plot, arg):
+                            self.style_popup_slot = arg
+                            return
+                        self.active_slot = arg
+                        self.status = f"Active slot: {arg}"
+                        return
+
             for rect, kind, table, col in self.data_layout:
                 if rect.collidepoint(pos):
                     if kind == "header":
                         self.table_collapsed[table] = not self.table_collapsed.get(table, False)
                         return
                     if kind == "column":
-                        self.drag_item = DragItem(kind="column", value=col, table=table)
-                        self.drag_pos = pos
+                        if self.selected_plot and self.active_slot:
+                            self.assign_columns_to_slot(self.active_slot, table, [col])
+                        else:
+                            self.drag_item = DragItem(kind="column", value=col, table=table, values=[col])
+                            self.drag_pos = pos
                         return
 
             for rect, plot_name in self.plot_layout:
                 if rect.collidepoint(pos):
-                    self.drag_item = DragItem(kind="plot", value=plot_name)
-                    self.drag_pos = pos
+                    self.select_plot(plot_name)
                     return
 
         if button in (4, 5):
@@ -454,28 +618,27 @@ class App:
 
         item = self.drag_item
 
-        if item.kind == "plot" and self.plot_drop_rect.collidepoint(pos):
-            self.selected_plot = item.value
-            self.slot_values = {k: None for k in PLOT_SPECS[self.selected_plot]}
-            self.chart_surface = None
-            self.status = f"Selected plot type: {self.selected_plot}"
-
         if item.kind == "column" and self.selected_plot:
             for arg, rect in self.slot_layout.items():
                 if rect.collidepoint(pos):
-                    if self.selected_table is None:
-                        self.selected_table = item.table
-                    if self.selected_table != item.table:
-                        self.status = (
-                            f"All slots must use the same table. Active: {self.selected_table}, dropped: {item.table}"
-                        )
-                        break
-                    self.slot_values[arg] = item.value
-                    self.chart_surface = None
-                    self.status = f"Assigned {item.value} to {arg}"
+                    self.active_slot = arg
+                    self.assign_columns_to_slot(arg, item.table or "", item.values or [item.value])
                     break
 
         self.drag_item = None
+
+    def handle_mouse_motion(self, pos: Tuple[int, int], buttons: Tuple[int, int, int]):
+        self.drag_pos = pos
+        if not self.drag_item or self.drag_item.kind != "column" or not buttons[0]:
+            return
+        table = self.drag_item.table
+        if not table:
+            return
+        for rect, kind, item_table, col in self.data_layout:
+            if kind == "column" and item_table == table and rect.collidepoint(pos):
+                if col not in self.drag_item.values:
+                    self.drag_item.values.append(col)
+                return
 
     def run(self):
         running = True
@@ -488,7 +651,7 @@ class App:
                 elif event.type == pygame.MOUSEBUTTONUP:
                     self.handle_mouse_up(event.pos, event.button)
                 elif event.type == pygame.MOUSEMOTION:
-                    self.drag_pos = event.pos
+                    self.handle_mouse_motion(event.pos, event.buttons)
 
             self.screen.fill(BG)
             self.draw_button(self.load_btn, "Load File", ACCENT)
@@ -501,6 +664,7 @@ class App:
             self.draw_chart_area()
             self.draw_status()
             self.draw_dragging()
+            self.draw_style_popup()
 
             pygame.display.flip()
             self.clock.tick(FPS)
