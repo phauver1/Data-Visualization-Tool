@@ -1,8 +1,10 @@
 import ast
 import inspect
+import json
+import math
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import matplotlib
@@ -18,16 +20,16 @@ from sklearn.model_selection import KFold, StratifiedKFold
 try:
     import tkinter as tk
     from tkinter import filedialog
-except Exception:  # pragma: no cover - tkinter may be unavailable in some environments
+except Exception:  # pragma: no cover
     tk = None
     filedialog = None
 
 
 # ------------------------------
-# Global UI configuration
+# Window and color configuration
 # ------------------------------
-WINDOW_W = 1600
-WINDOW_H = 920
+DEFAULT_WINDOW_W = 1600
+DEFAULT_WINDOW_H = 920
 FPS = 60
 
 BG = (24, 26, 32)
@@ -41,11 +43,21 @@ WARN = (225, 153, 88)
 BAD = (220, 84, 84)
 TOOLTIP_BG = (16, 19, 24)
 
+MENU_BG = (30, 34, 42)
+REL_MODAL_BG = (18, 21, 28)
+
+REL_JOIN_ORDER = ["inner", "left", "right", "outer"]
+REL_JOIN_COLORS = {
+    "inner": (74, 186, 108),
+    "left": (75, 170, 255),
+    "right": (225, 153, 88),
+    "outer": (186, 123, 255),
+}
+
 
 # ------------------------------
-# Seaborn plot registry
+# Plot and parameter registries
 # ------------------------------
-# This list targets the public plotting API (axes-level + figure-level) that ships with seaborn.
 SEABORN_PLOT_FUNCS = [
     "scatterplot",
     "lineplot",
@@ -73,15 +85,21 @@ SEABORN_PLOT_FUNCS = [
     "lmplot",
 ]
 
-
-# Column-like arguments that should be filled from dataframe columns in the GUI.
 COLUMN_PARAM_CANDIDATES = {
-    "x", "y", "hue", "size", "style", "units", "weights", "row", "col",
-    "x_vars", "y_vars", "vars",
+    "x",
+    "y",
+    "hue",
+    "size",
+    "style",
+    "units",
+    "weights",
+    "row",
+    "col",
+    "x_vars",
+    "y_vars",
+    "vars",
 }
 
-
-# Parameters where selecting from a fixed option list is more appropriate than free text.
 GLOBAL_FIXED_OPTIONS: Dict[str, List[Any]] = {
     "legend": ["auto", "brief", "full", True, False],
     "multiple": ["layer", "dodge", "stack", "fill"],
@@ -98,15 +116,23 @@ GLOBAL_FIXED_OPTIONS: Dict[str, List[Any]] = {
     "markers": [True, False],
     "diag_kind": ["auto", "hist", "kde", None],
     "palette": [
-        "deep", "muted", "bright", "pastel", "dark", "colorblind",
-        "viridis", "magma", "rocket", "mako", "crest", "flare",
+        "deep",
+        "muted",
+        "bright",
+        "pastel",
+        "dark",
+        "colorblind",
+        "viridis",
+        "magma",
+        "rocket",
+        "mako",
+        "crest",
+        "flare",
     ],
     "estimator": ["mean", "median", "sum", "min", "max"],
     "errorbar": ["ci", "pi", "se", "sd", None],
-    "kind": ["auto"],
     "log_scale": [True, False],
 }
-
 
 PLOT_PARAM_OVERRIDES: Dict[str, Dict[str, List[Any]]] = {
     "jointplot": {
@@ -130,7 +156,6 @@ PLOT_PARAM_OVERRIDES: Dict[str, Dict[str, List[Any]]] = {
     },
 }
 
-
 PLOT_DESCRIPTIONS = {
     "scatterplot": "Scatter plot for two variables, with semantic mappings.",
     "lineplot": "Line plot for trends across one axis, with grouping semantics.",
@@ -152,37 +177,34 @@ PLOT_DESCRIPTIONS = {
     "clustermap": "Heatmap with hierarchical clustering.",
     "jointplot": "Bivariate plot with marginal distributions.",
     "pairplot": "Grid of pairwise relationships across columns.",
-    "relplot": "Figure-level relational plot (scatter/line) with faceting.",
+    "relplot": "Figure-level relational plot with faceting.",
     "displot": "Figure-level distribution plot with faceting.",
     "catplot": "Figure-level categorical plot with faceting.",
     "lmplot": "Figure-level regression plot with faceting.",
     "rf_regression": "Random Forest regression with stratified 5-fold CV and feature importances.",
 }
 
-
 PARAM_DESCRIPTIONS = {
     "x": "Column mapped to the x axis.",
     "y": "Column mapped to the y axis.",
     "hue": "Column mapped to color grouping.",
-    "size": "Column mapped to marker/element size.",
+    "size": "Column mapped to marker/element size grouping.",
     "style": "Column mapped to marker or line style grouping.",
     "weights": "Column used as weights during estimation.",
     "row": "Facet row grouping column.",
     "col": "Facet column grouping column.",
     "vars": "Multiple columns used together for matrix-style plots.",
-    "x_vars": "Columns for x-axis variables in pair grids.",
-    "y_vars": "Columns for y-axis variables in pair grids.",
-    "kind": "Plot subtype for figure-level wrappers.",
+    "x_vars": "Columns for x variables in pair grids.",
+    "y_vars": "Columns for y variables in pair grids.",
+    "kind": "Subtype selector for figure-level wrappers.",
     "palette": "Color palette name or mapping.",
-    "orient": "Orientation of categorical plotting geometry.",
-    "fill": "Whether filled geometry should be used.",
-    "feature_columns": "Input feature columns for regression model.",
-    "target_column": "Single target/output column for regression model.",
+    "feature_columns": "Input feature columns for random forest regression.",
+    "target_column": "Single output/target column for random forest regression.",
 }
 
 
 # ------------------------------
-# Data model helpers
+# Data model classes
 # ------------------------------
 @dataclass
 class PlotSpec:
@@ -194,14 +216,24 @@ class PlotSpec:
     option_params: List[str]
     function_name: Optional[str] = None
     custom: bool = False
+    group: str = "Seaborn Plots"
 
 
 @dataclass
 class DragItem:
-    kind: str  # currently "column"
+    kind: str  # "column"
     value: str
     table: Optional[str] = None
     values: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Relation:
+    left_table: str
+    left_col: str
+    right_table: str
+    right_col: str
+    join_mode: str = "inner"
 
 
 class ScrollPanel:
@@ -220,12 +252,8 @@ class ScrollPanel:
 
 
 # ------------------------------
-# Plot specification building
+# Plot specification construction
 # ------------------------------
-def _is_bool_default(param: inspect.Parameter) -> bool:
-    return isinstance(param.default, bool)
-
-
 def _build_seaborn_spec(plot_name: str) -> PlotSpec:
     fn = getattr(sns, plot_name)
     sig = inspect.signature(fn)
@@ -235,23 +263,19 @@ def _build_seaborn_spec(plot_name: str) -> PlotSpec:
     option_params: List[str] = []
 
     for pname, param in sig.parameters.items():
-        # Skip generic/internal parameters from the GUI.
         if pname in {"self", "data", "ax", "kwargs"}:
             continue
         if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
             continue
 
-        # Decide whether this parameter is a dataframe-column assignment slot.
         if pname in COLUMN_PARAM_CANDIDATES:
             column_slots.append(pname)
             if param.default is inspect._empty:
                 required_slots.append(pname)
             continue
 
-        # Everything else becomes an optional parameter field in the settings panel.
         option_params.append(pname)
 
-    # Special handling where seaborn signatures do not mark practical requirements clearly.
     if plot_name == "countplot" and "x" not in required_slots and "y" not in required_slots:
         required_slots.append("x")
     if plot_name == "pairplot" and "vars" in column_slots and "vars" not in required_slots:
@@ -268,6 +292,7 @@ def _build_seaborn_spec(plot_name: str) -> PlotSpec:
         option_params=option_params,
         function_name=plot_name,
         custom=False,
+        group="Seaborn Plots",
     )
 
 
@@ -278,7 +303,6 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
         if hasattr(sns, plot_name):
             specs[plot_name] = _build_seaborn_spec(plot_name)
 
-    # Custom Random Forest Regression "plot" implemented through scikit-learn.
     rf_sig = inspect.signature(RandomForestRegressor)
     rf_options: List[str] = []
     for pname, param in rf_sig.parameters.items():
@@ -297,91 +321,141 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
         option_params=rf_options,
         function_name=None,
         custom=True,
+        group="AI Analysis",
     )
 
     return specs
 
 
 # ------------------------------
-# Main app
+# App implementation
 # ------------------------------
 class App:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Seaborn Visual Builder")
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        self.fullscreen = False
+        self.screen = pygame.display.set_mode((DEFAULT_WINDOW_W, DEFAULT_WINDOW_H), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
         self.font = pygame.font.SysFont("arial", 18)
         self.font_sm = pygame.font.SysFont("arial", 15)
         self.font_lg = pygame.font.SysFont("arial", 22, bold=True)
 
-        # Precompute plot specs so GUI can be driven generically by signatures.
         self.plot_specs = build_plot_specs()
+        self.plot_groups: Dict[str, Dict[str, Any]] = {
+            "Seaborn Plots": {"collapsed": False},
+            "AI Analysis": {"collapsed": False},
+        }
 
-        # Screen layout.
-        self.data_rect = pygame.Rect(15, 70, 430, WINDOW_H - 85)
-        self.plot_type_rect = pygame.Rect(WINDOW_W - 345, 70, 330, WINDOW_H - 85)
-        self.builder_rect = pygame.Rect(460, 70, WINDOW_W - 820, 500)
-        self.options_rect = pygame.Rect(460, 585, WINDOW_W - 820, WINDOW_H - 600)
-        self.chart_rect = pygame.Rect(460, 320, WINDOW_W - 820, 250)
+        self._current_menu_values: List[Any] = []
 
-        self.load_btn = pygame.Rect(15, 15, 130, 40)
-        self.calc_btn = pygame.Rect(460, 15, 130, 40)
-        self.clear_btn = pygame.Rect(600, 15, 130, 40)
-
-        # Scroll panels for left and right columns.
-        self.data_panel = ScrollPanel(self.data_rect.inflate(-12, -12))
-        self.plot_panel = ScrollPanel(self.plot_type_rect.inflate(-12, -12))
-        self.options_panel = ScrollPanel(self.options_rect.inflate(-12, -42))
-
-        # Loaded data and layout caches.
         self.dataframes: Dict[str, pd.DataFrame] = {}
         self.table_collapsed: Dict[str, bool] = {}
         self.data_layout: List[Tuple[pygame.Rect, str, str, str]] = []
-        self.plot_layout: List[Tuple[pygame.Rect, str]] = []
-
-        # Selection state.
-        self.selected_plot: Optional[str] = None
-        self.selected_table: Optional[str] = None
-        self.slot_values: Dict[str, Union[None, str, List[str]]] = {}
-        self.option_values: Dict[str, Any] = {}
-
-        # Interaction state.
+        self.plot_layout: List[Tuple[pygame.Rect, str, str]] = []  # (rect, kind, value)
         self.slot_layout: Dict[str, pygame.Rect] = {}
         self.option_layout: Dict[str, pygame.Rect] = {}
+
+        self.selected_plot: Optional[str] = None
+        self.slot_values: Dict[str, Union[None, str, List[str]]] = {}
+        self.option_values: Dict[str, Any] = {}
         self.active_slot: Optional[str] = None
 
         self.drag_item: Optional[DragItem] = None
         self.drag_pos = (0, 0)
 
-        # Popup/menu states for fixed-choice options and typed-value options.
-        self.menu_target: Optional[Tuple[str, bool]] = None  # (name, is_option)
+        self.menu_target: Optional[Tuple[str, bool]] = None
         self.menu_rect: Optional[pygame.Rect] = None
         self.menu_items: List[Tuple[pygame.Rect, Any]] = []
 
-        self.input_target: Optional[Tuple[str, bool]] = None  # (name, is_option)
+        self.input_target: Optional[Tuple[str, bool]] = None
         self.input_rect: Optional[pygame.Rect] = None
         self.input_value: str = ""
 
-        # Tooltip state.
-        self.tooltip_text: str = ""
-
+        self.tooltip_text = ""
         self.chart_surface: Optional[pygame.Surface] = None
-        self.status = "Load a CSV, Excel, or SQLite file to begin."
+        self.status = "Load one or more CSV/Excel/SQLite files to begin."
+
+        self.source_files: List[str] = []
+
+        # Relationship editor state.
+        self.relationships: List[Relation] = []
+        self.rel_editor_open = False
+        self.rel_modal_rect = pygame.Rect(0, 0, 0, 0)
+        self.rel_table_boxes: Dict[str, pygame.Rect] = {}
+        self.rel_column_boxes: List[Tuple[pygame.Rect, str, str]] = []
+        self.rel_line_layout: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
+        self.rel_drag_start: Optional[Tuple[str, str]] = None
+        self.rel_scroll_y = 0
+
+        self.update_layout()
 
     # ------------------------------
-    # File loading
+    # Layout and panel setup
     # ------------------------------
-    def open_file_picker(self) -> Optional[str]:
-        if not filedialog or not tk:
-            self.status = "tkinter is unavailable; cannot open file dialog in this environment."
+    def update_layout(self):
+        self.window_w, self.window_h = self.screen.get_size()
+
+        # Top menu bar occupies fixed height and hosts all control actions.
+        self.menu_bar_rect = pygame.Rect(0, 0, self.window_w, 50)
+
+        self.data_rect = pygame.Rect(12, 62, 420, self.window_h - 74)
+        self.plot_type_rect = pygame.Rect(self.window_w - 332, 62, 320, self.window_h - 74)
+
+        center_x = self.data_rect.right + 12
+        center_w = self.plot_type_rect.left - center_x - 12
+
+        self.builder_rect = pygame.Rect(center_x, 62, center_w, 300)
+        self.chart_rect = pygame.Rect(center_x, self.builder_rect.bottom + 10, center_w, 255)
+        self.options_rect = pygame.Rect(center_x, self.chart_rect.bottom + 10, center_w, self.window_h - (self.chart_rect.bottom + 22))
+
+        self.data_panel = ScrollPanel(self.data_rect.inflate(-10, -10))
+        self.plot_panel = ScrollPanel(self.plot_type_rect.inflate(-10, -10))
+        self.builder_panel = ScrollPanel(pygame.Rect(self.builder_rect.x + 10, self.builder_rect.y + 74, self.builder_rect.w - 20, self.builder_rect.h - 84))
+        self.options_panel = ScrollPanel(pygame.Rect(self.options_rect.x + 10, self.options_rect.y + 40, self.options_rect.w - 20, self.options_rect.h - 50))
+
+        self._build_menu_buttons()
+
+    def _build_menu_buttons(self):
+        # Menu buttons are arranged left-to-right and keep a consistent height.
+        labels = [
+            ("Load Files", ACCENT, "load_files"),
+            ("Save Plot", GOOD, "save_plot"),
+            ("Relationships", WARN, "relationships"),
+            ("Save State", (92, 146, 206), "save_state"),
+            ("Load State", (114, 174, 132), "load_state"),
+            ("Fullscreen", (108, 112, 138), "fullscreen"),
+            ("Calculate", GOOD, "calculate"),
+            ("Clear", WARN, "clear"),
+        ]
+        x = 10
+        y = 8
+        h = 34
+        self.menu_buttons: List[Tuple[pygame.Rect, str, Tuple[int, int, int], str]] = []
+        for text, color, action in labels:
+            w = max(96, self.font_sm.size(text)[0] + 20)
+            r = pygame.Rect(x, y, w, h)
+            self.menu_buttons.append((r, text, color, action))
+            x += w + 8
+
+    # ------------------------------
+    # File dialogs and persistence
+    # ------------------------------
+    def _make_tk_root(self):
+        if not tk:
             return None
-
         root = tk.Tk()
         root.withdraw()
-        path = filedialog.askopenfilename(
-            title="Select data file",
+        return root
+
+    def open_files_picker(self) -> List[str]:
+        if not filedialog or not tk:
+            self.status = "tkinter is unavailable; cannot open file dialog."
+            return []
+        root = self._make_tk_root()
+        paths = filedialog.askopenfilenames(
+            title="Select data file(s)",
             filetypes=[
                 ("Data files", "*.csv *.xlsx *.xls *.db *.sqlite *.sqlite3"),
                 ("CSV", "*.csv"),
@@ -390,10 +464,39 @@ class App:
                 ("All files", "*.*"),
             ],
         )
-        root.destroy()
+        if root:
+            root.destroy()
+        return list(paths)
+
+    def pick_save_path(self, title: str, ext: str, filetypes: List[Tuple[str, str]]) -> Optional[str]:
+        if not filedialog or not tk:
+            self.status = "tkinter is unavailable; cannot open save dialog."
+            return None
+        root = self._make_tk_root()
+        path = filedialog.asksaveasfilename(title=title, defaultextension=ext, filetypes=filetypes)
+        if root:
+            root.destroy()
         return path or None
 
-    def load_file(self, path: str):
+    def pick_open_path(self, title: str, filetypes: List[Tuple[str, str]]) -> Optional[str]:
+        if not filedialog or not tk:
+            self.status = "tkinter is unavailable; cannot open file dialog."
+            return None
+        root = self._make_tk_root()
+        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if root:
+            root.destroy()
+        return path or None
+
+    def _unique_table_name(self, base_name: str) -> str:
+        if base_name not in self.dataframes:
+            return base_name
+        n = 2
+        while f"{base_name}_{n}" in self.dataframes:
+            n += 1
+        return f"{base_name}_{n}"
+
+    def load_file(self, path: str, append: bool = True) -> bool:
         ext = os.path.splitext(path)[1].lower()
         new_data: Dict[str, pd.DataFrame] = {}
 
@@ -413,33 +516,122 @@ class App:
                         conn,
                     )["name"].tolist()
                     for table in table_names:
-                        df = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
-                        new_data[str(table)] = df
+                        new_data[str(table)] = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
                 finally:
                     conn.close()
             else:
                 self.status = f"Unsupported file extension: {ext}"
-                return
+                return False
         except Exception as e:
             self.status = f"Failed to load file: {e}"
-            return
+            return False
 
         if not new_data:
             self.status = "No tables/sheets found in selected file."
+            return False
+
+        if not append:
+            self.dataframes = {}
+            self.table_collapsed = {}
+            self.relationships = []
+
+        count = 0
+        for name, df in new_data.items():
+            unique = self._unique_table_name(name)
+            self.dataframes[unique] = df
+            self.table_collapsed[unique] = False
+            count += 1
+
+        if path not in self.source_files:
+            self.source_files.append(path)
+
+        self.status = f"Loaded {count} table(s) from {os.path.basename(path)}"
+        return True
+
+    def load_files(self, paths: List[str], append: bool = True):
+        if not paths:
+            return
+        loaded = 0
+        for i, path in enumerate(paths):
+            ok = self.load_file(path, append=(append if i == 0 else True))
+            if ok:
+                loaded += 1
+        if loaded:
+            self.status = f"Loaded {loaded} file(s). Total tables: {len(self.dataframes)}"
+
+    def save_plot(self):
+        if self.chart_surface is None:
+            self.status = "No plot to save."
+            return
+        path = self.pick_save_path("Save plot", ".png", [("PNG", "*.png"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            pygame.image.save(self.chart_surface, path)
+            self.status = f"Saved plot to {os.path.basename(path)}"
+        except Exception as e:
+            self.status = f"Failed to save plot: {e}"
+
+    def save_state(self):
+        path = self.pick_save_path("Save app state", ".json", [("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        payload = {
+            "source_files": self.source_files,
+            "selected_plot": self.selected_plot,
+            "slot_values": self.slot_values,
+            "option_values": self.option_values,
+            "relationships": [asdict(r) for r in self.relationships],
+            "plot_groups": self.plot_groups,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            self.status = f"Saved state to {os.path.basename(path)}"
+        except Exception as e:
+            self.status = f"Failed to save state: {e}"
+
+    def load_state(self):
+        path = self.pick_open_path("Load app state", [("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            self.status = f"Failed to load state file: {e}"
             return
 
-        self.dataframes = new_data
-        self.table_collapsed = {k: False for k in new_data.keys()}
-        self.selected_table = None
-        self.selected_plot = None
-        self.slot_values = {}
-        self.option_values = {}
-        self.active_slot = None
-        self.close_menu()
-        self.close_input_dialog()
-        self.chart_surface = None
+        files = payload.get("source_files", [])
+        if not isinstance(files, list):
+            self.status = "Invalid state file: source_files malformed"
+            return
 
-        self.status = f"Loaded {len(new_data)} table(s) from {os.path.basename(path)}"
+        self.clear_selection(clear_data=True)
+        self.source_files = []
+        self.load_files(files, append=True)
+
+        self.selected_plot = payload.get("selected_plot")
+        if self.selected_plot and self.selected_plot not in self.plot_specs:
+            self.selected_plot = None
+
+        self.slot_values = payload.get("slot_values", {})
+        self.option_values = payload.get("option_values", {})
+
+        rels = []
+        for r in payload.get("relationships", []):
+            try:
+                rels.append(Relation(**r))
+            except Exception:
+                continue
+        self.relationships = rels
+
+        pg = payload.get("plot_groups", {})
+        for name in self.plot_groups:
+            if name in pg and isinstance(pg[name], dict):
+                self.plot_groups[name]["collapsed"] = bool(pg[name].get("collapsed", False))
+
+        self.status = f"Loaded state from {os.path.basename(path)}"
 
     # ------------------------------
     # Utility helpers
@@ -448,6 +640,11 @@ class App:
         if not self.selected_plot:
             return None
         return self.plot_specs.get(self.selected_plot)
+
+    def draw_text(self, text: str, pos: Tuple[int, int], color=TEXT, font=None):
+        if font is None:
+            font = self.font
+        self.screen.blit(font.render(text, True, color), pos)
 
     def clip_text(self, text: str, max_w: int, font: pygame.font.Font) -> str:
         if font.size(text)[0] <= max_w:
@@ -459,17 +656,55 @@ class App:
                 return t
         return ellipsis
 
-    def draw_text(self, text: str, pos: Tuple[int, int], color=TEXT, font=None):
-        if font is None:
-            font = self.font
-        surf = font.render(text, True, color)
-        self.screen.blit(surf, pos)
-
     def draw_button(self, rect: pygame.Rect, label: str, color: Tuple[int, int, int]):
         pygame.draw.rect(self.screen, color, rect, border_radius=8)
-        pygame.draw.rect(self.screen, (255, 255, 255), rect, width=2, border_radius=8)
-        txt = self.font.render(label, True, (255, 255, 255))
+        pygame.draw.rect(self.screen, (255, 255, 255), rect, width=1, border_radius=8)
+        txt = self.font_sm.render(label, True, (255, 255, 255))
         self.screen.blit(txt, txt.get_rect(center=rect.center))
+
+    def parse_input_value(self, raw: str) -> Any:
+        raw = raw.strip()
+        if raw == "":
+            return None
+        try:
+            return ast.literal_eval(raw)
+        except Exception:
+            return raw
+
+    def parameter_description(self, name: str) -> str:
+        return PARAM_DESCRIPTIONS.get(name, f"Parameter '{name}' for selected plot.")
+
+    def fixed_options_for(self, plot_name: str, param_name: str, default: Any = None) -> Optional[List[Any]]:
+        if param_name in PLOT_PARAM_OVERRIDES.get(plot_name, {}):
+            return PLOT_PARAM_OVERRIDES[plot_name][param_name]
+        if param_name in GLOBAL_FIXED_OPTIONS:
+            return GLOBAL_FIXED_OPTIONS[param_name]
+        if isinstance(default, bool):
+            return [True, False]
+        return None
+
+    def option_default(self, plot_name: str, opt: str) -> Any:
+        if plot_name == "rf_regression":
+            return inspect.signature(RandomForestRegressor).parameters[opt].default
+        return inspect.signature(getattr(sns, plot_name)).parameters[opt].default
+
+    def close_menu(self):
+        self.menu_target = None
+        self.menu_rect = None
+        self.menu_items = []
+
+    def close_input_dialog(self):
+        self.input_target = None
+        self.input_rect = None
+        self.input_value = ""
+
+    def encode_col(self, table: str, col: str) -> str:
+        return f"{table}::{col}"
+
+    def decode_col(self, value: str) -> Tuple[str, str]:
+        if "::" not in value:
+            return "", value
+        return value.split("::", 1)
 
     def clear_plot_state(self):
         spec = self.current_spec()
@@ -485,57 +720,14 @@ class App:
 
     def select_plot(self, plot_name: str):
         self.selected_plot = plot_name
+        self.clear_plot_state()
         self.chart_surface = None
         self.close_menu()
         self.close_input_dialog()
-        self.clear_plot_state()
         self.status = f"Selected plot: {plot_name}"
 
-    def close_menu(self):
-        self.menu_target = None
-        self.menu_rect = None
-        self.menu_items = []
-
-    def close_input_dialog(self):
-        self.input_target = None
-        self.input_rect = None
-        self.input_value = ""
-
-    def fixed_options_for(self, plot_name: str, param_name: str, default: Any = None) -> Optional[List[Any]]:
-        # Plot-specific options have priority over global options.
-        if param_name in PLOT_PARAM_OVERRIDES.get(plot_name, {}):
-            return PLOT_PARAM_OVERRIDES[plot_name][param_name]
-        if param_name in GLOBAL_FIXED_OPTIONS:
-            return GLOBAL_FIXED_OPTIONS[param_name]
-        # If default is boolean, treat as fixed True/False.
-        if isinstance(default, bool):
-            return [True, False]
-        return None
-
-    def option_default(self, plot_name: str, opt: str) -> Any:
-        if plot_name == "rf_regression":
-            sig = inspect.signature(RandomForestRegressor)
-            return sig.parameters[opt].default
-        fn = getattr(sns, plot_name)
-        return inspect.signature(fn).parameters[opt].default
-
-    def parse_input_value(self, raw: str) -> Any:
-        # Convert common literal inputs into Python types.
-        # Example supported values: 10, 0.25, True, None, [1,2], ("a","b")
-        raw = raw.strip()
-        if raw == "":
-            return None
-        try:
-            return ast.literal_eval(raw)
-        except Exception:
-            # Fall back to string when literal parsing fails.
-            return raw
-
-    def parameter_description(self, name: str) -> str:
-        return PARAM_DESCRIPTIONS.get(name, f"Parameter '{name}' for the selected plot.")
-
     # ------------------------------
-    # Drawing panels
+    # Drawing helpers
     # ------------------------------
     def draw_scrollbar(self, panel: ScrollPanel):
         v = panel.rect
@@ -549,38 +741,51 @@ class App:
         thumb = pygame.Rect(track.x, thumb_y, track.w, thumb_h)
         pygame.draw.rect(self.screen, (120, 130, 150), thumb, border_radius=4)
 
+    def draw_menu_bar(self):
+        pygame.draw.rect(self.screen, MENU_BG, self.menu_bar_rect)
+        pygame.draw.line(self.screen, (90, 96, 110), (0, self.menu_bar_rect.bottom), (self.window_w, self.menu_bar_rect.bottom), 1)
+        for rect, text, color, _ in self.menu_buttons:
+            self.draw_button(rect, text, color)
+
     def draw_data_panel(self):
         pygame.draw.rect(self.screen, PANEL, self.data_rect, border_radius=10)
         pygame.draw.rect(self.screen, (255, 255, 255), self.data_rect, width=1, border_radius=10)
-        self.draw_text("Data", (self.data_rect.x + 14, self.data_rect.y + 10), font=self.font_lg)
+        self.draw_text("Data", (self.data_rect.x + 12, self.data_rect.y + 10), font=self.font_lg)
 
         viewport = self.data_panel.rect
         pygame.draw.rect(self.screen, PANEL_ALT, viewport, border_radius=6)
 
         self.data_layout = []
         y = viewport.y + 8 - self.data_panel.scroll_y
-        row_h = 30
-        col_h = 24
+        row_h = 28
+        col_h = 22
+
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
 
         for table, df in self.dataframes.items():
-            header_rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, row_h)
+            h_rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, row_h)
             marker = "+" if self.table_collapsed.get(table, False) else "-"
-            pygame.draw.rect(self.screen, (55, 62, 75), header_rect, border_radius=6)
-            name = self.clip_text(f"{marker} {table} ({len(df.columns)} cols)", header_rect.w - 12, self.font)
-            self.draw_text(name, (header_rect.x + 8, header_rect.y + 6))
-            self.data_layout.append((header_rect, "header", table, ""))
+            if viewport.colliderect(h_rect):
+                pygame.draw.rect(self.screen, (55, 62, 75), h_rect, border_radius=6)
+                txt = self.clip_text(f"{marker} {table} ({len(df.columns)} cols)", h_rect.w - 12, self.font_sm)
+                self.draw_text(txt, (h_rect.x + 8, h_rect.y + 6), font=self.font_sm)
+            self.data_layout.append((h_rect, "header", table, ""))
             y += row_h + 4
 
             if not self.table_collapsed.get(table, False):
                 for col in df.columns:
-                    c_rect = pygame.Rect(viewport.x + 20, y, viewport.w - 30, col_h)
-                    pygame.draw.rect(self.screen, (70, 78, 92), c_rect, border_radius=5)
-                    c_text = self.clip_text(str(col), c_rect.w - 10, self.font_sm)
-                    self.draw_text(c_text, (c_rect.x + 6, c_rect.y + 4), font=self.font_sm)
+                    c_rect = pygame.Rect(viewport.x + 18, y, viewport.w - 28, col_h)
+                    if viewport.colliderect(c_rect):
+                        pygame.draw.rect(self.screen, (70, 78, 92), c_rect, border_radius=5)
+                        c_text = self.clip_text(str(col), c_rect.w - 10, self.font_sm)
+                        self.draw_text(c_text, (c_rect.x + 6, c_rect.y + 3), font=self.font_sm)
                     self.data_layout.append((c_rect, "column", table, str(col)))
                     y += col_h + 3
 
             y += 4
+
+        self.screen.set_clip(prev_clip)
 
         self.data_panel.content_h = max(viewport.h, y - viewport.y + self.data_panel.scroll_y + 8)
         self.data_panel.clamp_scroll()
@@ -590,22 +795,44 @@ class App:
     def draw_plot_type_panel(self):
         pygame.draw.rect(self.screen, PANEL, self.plot_type_rect, border_radius=10)
         pygame.draw.rect(self.screen, (255, 255, 255), self.plot_type_rect, width=1, border_radius=10)
-        self.draw_text("Plot Types", (self.plot_type_rect.x + 14, self.plot_type_rect.y + 10), font=self.font_lg)
+        self.draw_text("Plot Types", (self.plot_type_rect.x + 12, self.plot_type_rect.y + 10), font=self.font_lg)
 
         viewport = self.plot_panel.rect
         pygame.draw.rect(self.screen, PANEL_ALT, viewport, border_radius=6)
 
         self.plot_layout = []
         y = viewport.y + 8 - self.plot_panel.scroll_y
-        item_h = 34
+        header_h = 30
+        item_h = 32
 
-        for plot_name in self.plot_specs.keys():
-            rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, item_h)
-            fill = (61, 91, 133) if plot_name == self.selected_plot else (58, 66, 82)
-            pygame.draw.rect(self.screen, fill, rect, border_radius=6)
-            self.draw_text(plot_name, (rect.x + 8, rect.y + 7), font=self.font_sm)
-            self.plot_layout.append((rect, plot_name))
-            y += item_h + 6
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
+
+        for group_name in ["Seaborn Plots", "AI Analysis"]:
+            g_rect = pygame.Rect(viewport.x + 6, y, viewport.w - 12, header_h)
+            if viewport.colliderect(g_rect):
+                pygame.draw.rect(self.screen, (48, 53, 64), g_rect, border_radius=6)
+                marker = "+" if self.plot_groups[group_name]["collapsed"] else "-"
+                self.draw_text(f"{marker} {group_name}", (g_rect.x + 8, g_rect.y + 7), font=self.font_sm)
+            self.plot_layout.append((g_rect, "group", group_name))
+            y += header_h + 4
+
+            if self.plot_groups[group_name]["collapsed"]:
+                continue
+
+            for plot_name, spec in self.plot_specs.items():
+                if spec.group != group_name:
+                    continue
+                p_rect = pygame.Rect(viewport.x + 16, y, viewport.w - 24, item_h)
+                if viewport.colliderect(p_rect):
+                    fill = (61, 91, 133) if plot_name == self.selected_plot else (58, 66, 82)
+                    pygame.draw.rect(self.screen, fill, p_rect, border_radius=6)
+                    self.draw_text(plot_name, (p_rect.x + 8, p_rect.y + 7), font=self.font_sm)
+                self.plot_layout.append((p_rect, "plot", plot_name))
+                y += item_h + 5
+            y += 4
+
+        self.screen.set_clip(prev_clip)
 
         self.plot_panel.content_h = max(viewport.h, y - viewport.y + self.plot_panel.scroll_y + 8)
         self.plot_panel.clamp_scroll()
@@ -615,122 +842,146 @@ class App:
     def draw_builder_area(self):
         pygame.draw.rect(self.screen, PANEL, self.builder_rect, border_radius=10)
         pygame.draw.rect(self.screen, (255, 255, 255), self.builder_rect, width=1, border_radius=10)
-        self.draw_text("Builder", (self.builder_rect.x + 14, self.builder_rect.y + 10), font=self.font_lg)
+        self.draw_text("Builder", (self.builder_rect.x + 12, self.builder_rect.y + 8), font=self.font_lg)
+
+        spec = self.current_spec()
+        header_y = self.builder_rect.y + 34
 
         self.slot_layout = {}
-
-        top = self.builder_rect.y + 44
-        spec = self.current_spec()
-
         if not spec:
-            self.draw_text("Click a plot type on the right to begin.", (self.builder_rect.x + 16, top), MUTED)
+            self.draw_text("Select a plot from the right panel.", (self.builder_rect.x + 12, header_y), MUTED, self.font_sm)
             return
 
-        self.draw_text(self.clip_text(spec.description, self.builder_rect.w - 32, self.font_sm),
-                       (self.builder_rect.x + 16, top), MUTED, self.font_sm)
-        top += 30
+        self.draw_text(self.clip_text(spec.description, self.builder_rect.w - 24, self.font_sm), (self.builder_rect.x + 12, header_y), MUTED, self.font_sm)
+        self.draw_text("Click an input row, then click/drag columns from Data panel.", (self.builder_rect.x + 12, header_y + 20), MUTED, self.font_sm)
 
-        table_msg = f"Table: {self.selected_table}" if self.selected_table else "Table: (unset)"
-        self.draw_text(table_msg, (self.builder_rect.x + 16, top), MUTED, self.font_sm)
-        top += 28
-
-        # Draw one row per column-slot parameter.
-        for slot in spec.column_slots:
-            s_rect = pygame.Rect(self.builder_rect.x + 16, top, self.builder_rect.w - 32, 40)
-            pygame.draw.rect(self.screen, (66, 72, 88), s_rect, border_radius=8)
-            border_col = ACCENT if slot == self.active_slot else (120, 130, 150)
-            pygame.draw.rect(self.screen, border_col, s_rect, width=1, border_radius=8)
-
-            val = self.slot_values.get(slot)
-            if isinstance(val, list):
-                body = ", ".join(val) if val else "[click slot, then click/drag columns]"
-            else:
-                body = str(val) if val else "[click slot, then click column]"
-
-            req = "*" if slot in spec.required_slots else ""
-            text = f"{slot}{req}: {body}"
-            self.draw_text(self.clip_text(text, s_rect.w - 16, self.font_sm),
-                           (s_rect.x + 8, s_rect.y + 11), font=self.font_sm)
-            self.slot_layout[slot] = s_rect
-            top += 47
-
-    def draw_options_area(self):
-        pygame.draw.rect(self.screen, PANEL, self.options_rect, border_radius=10)
-        pygame.draw.rect(self.screen, (255, 255, 255), self.options_rect, width=1, border_radius=10)
-        self.draw_text("Optional Inputs", (self.options_rect.x + 14, self.options_rect.y + 10), font=self.font_lg)
-
-        self.option_layout = {}
-        spec = self.current_spec()
-        if not spec:
-            self.draw_text("Select a plot first.", (self.options_rect.x + 16, self.options_rect.y + 44), MUTED)
-            return
-
-        viewport = self.options_panel.rect
+        viewport = self.builder_panel.rect
         pygame.draw.rect(self.screen, PANEL_ALT, viewport, border_radius=6)
 
-        y = viewport.y + 6 - self.options_panel.scroll_y
-        x = viewport.x + 6
-        w = viewport.w - 12
-        h = 32
+        y = viewport.y + 8 - self.builder_panel.scroll_y
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
 
-        for opt in spec.option_params:
-            r = pygame.Rect(x, y, w, h)
-            if viewport.colliderect(r):
-                pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=6)
-                pygame.draw.rect(self.screen, (120, 130, 150), r, width=1, border_radius=6)
+        for slot in spec.column_slots:
+            s_rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, 38)
+            if viewport.colliderect(s_rect):
+                pygame.draw.rect(self.screen, (66, 72, 88), s_rect, border_radius=8)
+                border = ACCENT if slot == self.active_slot else (120, 130, 150)
+                pygame.draw.rect(self.screen, border, s_rect, width=1, border_radius=8)
 
-                val = self.option_values.get(opt)
-                shown = "(unset)" if val is None else str(val)
-                text = f"{opt}: {shown}"
-                self.draw_text(self.clip_text(text, r.w - 12, self.font_sm), (r.x + 8, r.y + 8), font=self.font_sm)
-                self.option_layout[opt] = r
-            y += h + 6
+                val = self.slot_values.get(slot)
+                if isinstance(val, list):
+                    shown = ", ".join([f"{self.decode_col(v)[0]}.{self.decode_col(v)[1]}" for v in val]) if val else "[unset]"
+                elif isinstance(val, str):
+                    t, c = self.decode_col(val)
+                    shown = f"{t}.{c}"
+                else:
+                    shown = "[unset]"
 
-        self.options_panel.content_h = max(viewport.h, y - viewport.y + self.options_panel.scroll_y + 8)
-        self.options_panel.clamp_scroll()
-        if self.options_panel.content_h > viewport.h:
-            self.draw_scrollbar(self.options_panel)
+                req = "*" if slot in spec.required_slots else ""
+                text = f"{slot}{req}: {shown}"
+                self.draw_text(self.clip_text(text, s_rect.w - 12, self.font_sm), (s_rect.x + 8, s_rect.y + 10), font=self.font_sm)
+            self.slot_layout[slot] = s_rect
+            y += 44
+
+        self.screen.set_clip(prev_clip)
+
+        self.builder_panel.content_h = max(viewport.h, y - viewport.y + self.builder_panel.scroll_y + 8)
+        self.builder_panel.clamp_scroll()
+        if self.builder_panel.content_h > viewport.h:
+            self.draw_scrollbar(self.builder_panel)
 
     def draw_chart_area(self):
         pygame.draw.rect(self.screen, PANEL, self.chart_rect, border_radius=10)
         pygame.draw.rect(self.screen, (255, 255, 255), self.chart_rect, width=1, border_radius=10)
-        self.draw_text("Preview", (self.chart_rect.x + 14, self.chart_rect.y + 10), font=self.font_lg)
+        self.draw_text("Preview", (self.chart_rect.x + 12, self.chart_rect.y + 8), font=self.font_lg)
 
-        inner = self.chart_rect.inflate(-24, -48)
-        inner.y += 16
+        inner = self.chart_rect.inflate(-18, -42)
+        inner.y += 14
         pygame.draw.rect(self.screen, (16, 18, 24), inner, border_radius=8)
 
         if self.chart_surface:
             scaled = pygame.transform.smoothscale(self.chart_surface, (inner.w, inner.h))
             self.screen.blit(scaled, inner.topleft)
         else:
-            self.draw_text("Press Calculate to generate plot", (inner.x + 12, inner.y + 10), MUTED)
+            self.draw_text("Use Calculate to generate preview.", (inner.x + 10, inner.y + 8), MUTED, self.font_sm)
+
+    def draw_options_area(self):
+        pygame.draw.rect(self.screen, PANEL, self.options_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (255, 255, 255), self.options_rect, width=1, border_radius=10)
+        self.draw_text("Optional Inputs", (self.options_rect.x + 12, self.options_rect.y + 8), font=self.font_lg)
+
+        self.option_layout = {}
+        spec = self.current_spec()
+        if not spec:
+            self.draw_text("Select a plot first.", (self.options_rect.x + 12, self.options_rect.y + 34), MUTED, self.font_sm)
+            return
+
+        viewport = self.options_panel.rect
+        pygame.draw.rect(self.screen, PANEL_ALT, viewport, border_radius=6)
+
+        y = viewport.y + 6 - self.options_panel.scroll_y
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
+
+        for opt in spec.option_params:
+            r = pygame.Rect(viewport.x + 6, y, viewport.w - 12, 30)
+            if viewport.colliderect(r):
+                pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=6)
+                pygame.draw.rect(self.screen, (120, 130, 150), r, width=1, border_radius=6)
+                val = self.option_values.get(opt)
+                shown = "(unset)" if val is None else str(val)
+                txt = f"{opt}: {shown}"
+                self.draw_text(self.clip_text(txt, r.w - 10, self.font_sm), (r.x + 8, r.y + 7), font=self.font_sm)
+            self.option_layout[opt] = r
+            y += 35
+
+        self.screen.set_clip(prev_clip)
+
+        self.options_panel.content_h = max(viewport.h, y - viewport.y + self.options_panel.scroll_y + 8)
+        self.options_panel.clamp_scroll()
+        if self.options_panel.content_h > viewport.h:
+            self.draw_scrollbar(self.options_panel)
 
     def draw_status(self):
-        status_rect = pygame.Rect(740, 15, WINDOW_W - 755, 40)
-        pygame.draw.rect(self.screen, (40, 44, 54), status_rect, border_radius=8)
-        text = self.clip_text(self.status, status_rect.w - 14, self.font_sm)
-        self.draw_text(text, (status_rect.x + 7, status_rect.y + 12), MUTED, self.font_sm)
+        rect = pygame.Rect(max(10, self.window_w - 520), 8, min(510, self.window_w - 20), 34)
+        pygame.draw.rect(self.screen, (40, 44, 54), rect, border_radius=8)
+        txt = self.clip_text(self.status, rect.w - 12, self.font_sm)
+        self.draw_text(txt, (rect.x + 6, rect.y + 8), MUTED, self.font_sm)
 
     def draw_dragging(self):
         if not self.drag_item:
             return
-
         cols = self.drag_item.values if self.drag_item.values else [self.drag_item.value]
         label = f"{self.drag_item.table}: {len(cols)} col(s)" if len(cols) > 1 else f"{self.drag_item.table}.{cols[0]}"
-
-        txt = self.font.render(label, True, (255, 255, 255))
-        r = txt.get_rect()
-        r.topleft = (self.drag_pos[0] + 10, self.drag_pos[1] + 8)
-        bg = r.inflate(16, 10)
+        txt = self.font_sm.render(label, True, (255, 255, 255))
+        r = txt.get_rect(topleft=(self.drag_pos[0] + 10, self.drag_pos[1] + 8))
+        bg = r.inflate(14, 8)
         pygame.draw.rect(self.screen, (90, 100, 120), bg, border_radius=6)
         self.screen.blit(txt, r)
+
+    # ------------------------------
+    # Popups and dialogs
+    # ------------------------------
+    def open_fixed_option_menu(self, name: str, is_option: bool, choices: List[Any]):
+        self.close_input_dialog()
+        h = min(self.window_h - 80, 50 + len(choices) * 34)
+        w = min(420, self.builder_rect.w - 20)
+        self.menu_rect = pygame.Rect(self.builder_rect.centerx - w // 2, self.builder_rect.centery - h // 2, w, h)
+        self.menu_target = (name, is_option)
+        self._current_menu_values = choices
+
+    def open_input_dialog(self, name: str, is_option: bool, current_value: Any):
+        self.close_menu()
+        w = min(520, self.builder_rect.w - 20)
+        self.input_rect = pygame.Rect(self.builder_rect.centerx - w // 2, self.builder_rect.centery - 70, w, 130)
+        self.input_target = (name, is_option)
+        self.input_value = "" if current_value is None else str(current_value)
 
     def draw_menu_popup(self):
         if not self.menu_target or not self.menu_rect:
             return
-
-        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
         overlay.fill((5, 8, 14, 120))
         self.screen.blit(overlay, (0, 0))
 
@@ -742,18 +993,20 @@ class App:
 
         self.menu_items = []
         y = self.menu_rect.y + 38
-        for val in self._current_menu_values:
+        clip = self.screen.get_clip()
+        self.screen.set_clip(self.menu_rect)
+        for v in self._current_menu_values:
             r = pygame.Rect(self.menu_rect.x + 12, y, self.menu_rect.w - 24, 30)
             pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=6)
-            self.draw_text(str(val), (r.x + 8, r.y + 7), font=self.font_sm)
-            self.menu_items.append((r, val))
-            y += 35
+            self.draw_text(self.clip_text(str(v), r.w - 10, self.font_sm), (r.x + 8, r.y + 7), font=self.font_sm)
+            self.menu_items.append((r, v))
+            y += 34
+        self.screen.set_clip(clip)
 
     def draw_input_dialog(self):
         if not self.input_target or not self.input_rect:
             return
-
-        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
         overlay.fill((5, 8, 14, 120))
         self.screen.blit(overlay, (0, 0))
 
@@ -761,100 +1014,280 @@ class App:
         pygame.draw.rect(self.screen, (255, 255, 255), self.input_rect, width=1, border_radius=10)
 
         label = self.input_target[0]
-        self.draw_text(f"Type value for {label}", (self.input_rect.x + 12, self.input_rect.y + 10), font=self.font_sm)
-        self.draw_text("Enter=Save, Esc=Cancel", (self.input_rect.x + 12, self.input_rect.y + 34), MUTED, self.font_sm)
+        self.draw_text(f"Type value for {label}", (self.input_rect.x + 10, self.input_rect.y + 10), font=self.font_sm)
+        self.draw_text("Enter=Save Esc=Cancel", (self.input_rect.x + 10, self.input_rect.y + 32), MUTED, self.font_sm)
 
-        field = pygame.Rect(self.input_rect.x + 12, self.input_rect.y + 60, self.input_rect.w - 24, 34)
+        field = pygame.Rect(self.input_rect.x + 10, self.input_rect.y + 58, self.input_rect.w - 20, 34)
         pygame.draw.rect(self.screen, (18, 21, 27), field, border_radius=6)
         pygame.draw.rect(self.screen, ACCENT, field, width=1, border_radius=6)
-        self.draw_text(self.clip_text(self.input_value, field.w - 12, self.font_sm), (field.x + 8, field.y + 8), font=self.font_sm)
-
-    def draw_tooltip(self, mouse_pos: Tuple[int, int]):
-        if not self.tooltip_text:
-            return
-
-        pad = 8
-        txt = self.font_sm.render(self.tooltip_text, True, TEXT)
-        r = txt.get_rect()
-        box = pygame.Rect(mouse_pos[0] + 14, mouse_pos[1] + 14, r.w + pad * 2, r.h + pad * 2)
-
-        # Keep tooltip on-screen.
-        if box.right > WINDOW_W - 8:
-            box.x = WINDOW_W - box.w - 8
-        if box.bottom > WINDOW_H - 8:
-            box.y = WINDOW_H - box.h - 8
-
-        pygame.draw.rect(self.screen, TOOLTIP_BG, box, border_radius=6)
-        pygame.draw.rect(self.screen, (120, 130, 150), box, width=1, border_radius=6)
-        self.screen.blit(txt, (box.x + pad, box.y + pad))
+        self.draw_text(self.clip_text(self.input_value, field.w - 10, self.font_sm), (field.x + 8, field.y + 8), font=self.font_sm)
 
     # ------------------------------
-    # Value assignment helpers
+    # Relationship editor modal
+    # ------------------------------
+    def relation_exists(self, a_table: str, a_col: str, b_table: str, b_col: str) -> bool:
+        for r in self.relationships:
+            if (
+                r.left_table == a_table
+                and r.left_col == a_col
+                and r.right_table == b_table
+                and r.right_col == b_col
+            ) or (
+                r.left_table == b_table
+                and r.left_col == b_col
+                and r.right_table == a_table
+                and r.right_col == a_col
+            ):
+                return True
+        return False
+
+    def cycle_join_mode(self, idx: int):
+        r = self.relationships[idx]
+        current = REL_JOIN_ORDER.index(r.join_mode) if r.join_mode in REL_JOIN_ORDER else 0
+        r.join_mode = REL_JOIN_ORDER[(current + 1) % len(REL_JOIN_ORDER)]
+        self.status = f"Relationship join mode changed to {r.join_mode}"
+
+    def point_to_segment_distance(self, p: Tuple[int, int], a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        ax, ay = a
+        bx, by = b
+        px, py = p
+        dx = bx - ax
+        dy = by - ay
+        if dx == 0 and dy == 0:
+            return math.hypot(px - ax, py - ay)
+        t = ((px - ax) * dx + (py - ay) * dy) / float(dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        qx = ax + t * dx
+        qy = ay + t * dy
+        return math.hypot(px - qx, py - qy)
+
+    def draw_relationship_editor(self):
+        if not self.rel_editor_open:
+            return
+
+        overlay = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 170))
+        self.screen.blit(overlay, (0, 0))
+
+        w = min(1200, self.window_w - 60)
+        h = min(760, self.window_h - 80)
+        self.rel_modal_rect = pygame.Rect((self.window_w - w) // 2, (self.window_h - h) // 2, w, h)
+
+        pygame.draw.rect(self.screen, REL_MODAL_BG, self.rel_modal_rect, border_radius=12)
+        pygame.draw.rect(self.screen, (255, 255, 255), self.rel_modal_rect, width=1, border_radius=12)
+
+        self.draw_text("Relationships Editor (Esc to close)", (self.rel_modal_rect.x + 14, self.rel_modal_rect.y + 12), font=self.font_lg)
+
+        canvas = self.rel_modal_rect.inflate(-20, -70)
+        canvas.y += 30
+        pygame.draw.rect(self.screen, PANEL_ALT, canvas, border_radius=8)
+
+        # Compute table boxes on a grid and clip all content to canvas to avoid spill-over.
+        self.rel_table_boxes = {}
+        self.rel_column_boxes = []
+        self.rel_line_layout = []
+
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(canvas)
+
+        tables = list(self.dataframes.keys())
+        cols = max(1, min(4, len(tables)))
+        card_w = max(220, (canvas.w - (cols + 1) * 14) // cols)
+        x0 = canvas.x + 14
+        y0 = canvas.y + 14 - self.rel_scroll_y
+
+        for idx, table in enumerate(tables):
+            c = idx % cols
+            r = idx // cols
+            x = x0 + c * (card_w + 14)
+            y = y0 + r * 260
+            box = pygame.Rect(x, y, card_w, 240)
+            self.rel_table_boxes[table] = box
+
+            pygame.draw.rect(self.screen, (50, 60, 76), box, border_radius=8)
+            pygame.draw.rect(self.screen, (120, 130, 150), box, width=1, border_radius=8)
+            self.draw_text(self.clip_text(table, box.w - 10, self.font_sm), (box.x + 6, box.y + 6), font=self.font_sm)
+
+            col_y = box.y + 30
+            max_rows = 9
+            for i, col in enumerate(self.dataframes[table].columns[:max_rows]):
+                cr = pygame.Rect(box.x + 6, col_y, box.w - 12, 20)
+                pygame.draw.rect(self.screen, (72, 82, 100), cr, border_radius=4)
+                self.draw_text(self.clip_text(str(col), cr.w - 10, self.font_sm), (cr.x + 5, cr.y + 2), font=self.font_sm)
+                self.rel_column_boxes.append((cr, table, str(col)))
+                col_y += 23
+            if len(self.dataframes[table].columns) > max_rows:
+                self.draw_text("...", (box.x + box.w - 20, box.y + box.h - 20), MUTED, self.font_sm)
+
+        # Draw existing relationship lines.
+        for i, rel in enumerate(self.relationships):
+            a = self._column_box_center(rel.left_table, rel.left_col)
+            b = self._column_box_center(rel.right_table, rel.right_col)
+            if not a or not b:
+                continue
+            color = REL_JOIN_COLORS.get(rel.join_mode, (200, 200, 200))
+            pygame.draw.line(self.screen, color, a, b, 3)
+            self.rel_line_layout.append((a, b, i))
+
+        # Draw relationship drag preview line.
+        if self.rel_drag_start:
+            st = self._column_box_center(self.rel_drag_start[0], self.rel_drag_start[1])
+            if st:
+                pygame.draw.line(self.screen, ACCENT, st, pygame.mouse.get_pos(), 2)
+
+        self.screen.set_clip(prev_clip)
+
+        # Legend for line colors / join modes.
+        legend = pygame.Rect(self.rel_modal_rect.right - 210, self.rel_modal_rect.y + 12, 190, 120)
+        pygame.draw.rect(self.screen, (40, 46, 56), legend, border_radius=8)
+        pygame.draw.rect(self.screen, (120, 130, 150), legend, width=1, border_radius=8)
+        self.draw_text("Join Mode Colors", (legend.x + 8, legend.y + 8), font=self.font_sm)
+        y = legend.y + 32
+        for mode in REL_JOIN_ORDER:
+            color = REL_JOIN_COLORS[mode]
+            pygame.draw.line(self.screen, color, (legend.x + 12, y + 7), (legend.x + 42, y + 7), 3)
+            self.draw_text(mode, (legend.x + 50, y), font=self.font_sm)
+            y += 20
+
+    def _column_box_center(self, table: str, col: str) -> Optional[Tuple[int, int]]:
+        for rect, t, c in self.rel_column_boxes:
+            if t == table and c == col:
+                return rect.center
+        return None
+
+    # ------------------------------
+    # Assignment and join logic
     # ------------------------------
     def assign_columns_to_slot(self, slot: str, table: str, columns: List[str]):
         spec = self.current_spec()
-        if not spec:
-            return
-        if not columns:
+        if not spec or not columns:
             return
 
-        if self.selected_table is None:
-            self.selected_table = table
-        if table != self.selected_table:
-            self.status = f"All selected columns must come from {self.selected_table}."
-            return
+        encoded = [self.encode_col(table, c) for c in columns]
 
         if slot in spec.multi_slots:
             existing = self.slot_values.get(slot)
             merged = list(existing) if isinstance(existing, list) else []
-            for c in columns:
-                if c not in merged:
-                    merged.append(c)
+            for e in encoded:
+                if e not in merged:
+                    merged.append(e)
             self.slot_values[slot] = merged
-            self.status = f"Assigned {len(columns)} column(s) to {slot}."
+            self.status = f"Assigned {len(columns)} column(s) to {slot}"
         else:
-            self.slot_values[slot] = columns[0]
-            self.status = f"Assigned {columns[0]} to {slot}."
+            self.slot_values[slot] = encoded[0]
+            self.status = f"Assigned {table}.{columns[0]} to {slot}"
 
         self.chart_surface = None
 
-    def open_fixed_option_menu(self, name: str, is_option: bool, choices: List[Any]):
-        self.close_input_dialog()
-        h = min(500, 55 + len(choices) * 35)
-        self.menu_rect = pygame.Rect(self.builder_rect.centerx - 190, self.builder_rect.centery - h // 2, 380, h)
-        self.menu_target = (name, is_option)
-        self._current_menu_values = choices
+    def gather_used_tables(self, spec: PlotSpec) -> Set[str]:
+        used: Set[str] = set()
+        for slot in spec.column_slots:
+            v = self.slot_values.get(slot)
+            if isinstance(v, list):
+                for e in v:
+                    t, _ = self.decode_col(e)
+                    if t:
+                        used.add(t)
+            elif isinstance(v, str):
+                t, _ = self.decode_col(v)
+                if t:
+                    used.add(t)
+        return used
 
-    def open_input_dialog(self, name: str, is_option: bool, current_value: Any):
-        self.close_menu()
-        self.input_rect = pygame.Rect(self.builder_rect.centerx - 230, self.builder_rect.centery - 70, 460, 130)
-        self.input_target = (name, is_option)
-        self.input_value = "" if current_value is None else str(current_value)
+    def _reverse_join_mode(self, mode: str) -> str:
+        if mode == "left":
+            return "right"
+        if mode == "right":
+            return "left"
+        return mode
 
-    # ------------------------------
-    # Plot calculation
-    # ------------------------------
-    def _collect_seaborn_kwargs(self, spec: PlotSpec, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    def build_joined_dataframe(self, used_tables: Set[str]) -> Tuple[Optional[pd.DataFrame], str]:
+        if not used_tables:
+            if not self.dataframes:
+                return None, "No data loaded."
+            # Fallback: allow plots that can run on whole dataframe with no explicit column slots.
+            used_tables = {next(iter(self.dataframes.keys()))}
+
+        root = next(iter(used_tables))
+        if root not in self.dataframes:
+            return None, f"Table '{root}' not found."
+
+        current = self.dataframes[root].copy()
+        current.columns = [f"{root}.{c}" for c in current.columns]
+        in_graph = {root}
+
+        pending = set(used_tables) - in_graph
+
+        while pending:
+            merged_any = False
+            for table in list(pending):
+                connector = None
+                reverse = False
+                for rel in self.relationships:
+                    if rel.left_table in in_graph and rel.right_table == table:
+                        connector = rel
+                        reverse = False
+                        break
+                    if rel.right_table in in_graph and rel.left_table == table:
+                        connector = rel
+                        reverse = True
+                        break
+                if connector is None:
+                    continue
+
+                new_df = self.dataframes[table].copy()
+                new_df.columns = [f"{table}.{c}" for c in new_df.columns]
+
+                if not reverse:
+                    left_key = f"{connector.left_table}.{connector.left_col}"
+                    right_key = f"{connector.right_table}.{connector.right_col}"
+                    how = connector.join_mode
+                else:
+                    left_key = f"{connector.right_table}.{connector.right_col}"
+                    right_key = f"{connector.left_table}.{connector.left_col}"
+                    how = self._reverse_join_mode(connector.join_mode)
+
+                if left_key not in current.columns:
+                    continue
+                if right_key not in new_df.columns:
+                    continue
+
+                current = pd.merge(current, new_df, how=how, left_on=left_key, right_on=right_key)
+                in_graph.add(table)
+                pending.remove(table)
+                merged_any = True
+
+            if not merged_any:
+                return None, "Selected tables are not fully connected by relationships."
+
+        return current, ""
+
+    def _collect_seaborn_kwargs(self, spec: PlotSpec, merged_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         kwargs: Dict[str, Any] = {}
 
         for slot in spec.column_slots:
-            val = self.slot_values.get(slot)
-            if val is None or val == []:
+            v = self.slot_values.get(slot)
+            if v is None or v == []:
                 continue
 
-            if isinstance(val, list):
-                missing = [c for c in val if c not in df.columns]
-                if missing:
-                    self.status = f"Missing column(s): {', '.join(missing)}"
-                    return None
-                kwargs[slot] = val
+            if isinstance(v, list):
+                mapped = []
+                for e in v:
+                    t, c = self.decode_col(e)
+                    cname = f"{t}.{c}" if t else c
+                    if cname not in merged_df.columns:
+                        self.status = f"Column not found after join: {cname}"
+                        return None
+                    mapped.append(cname)
+                kwargs[slot] = mapped
             else:
-                if val not in df.columns:
-                    self.status = f"Column {val} not found in selected table"
+                t, c = self.decode_col(v)
+                cname = f"{t}.{c}" if t else c
+                if cname not in merged_df.columns:
+                    self.status = f"Column not found after join: {cname}"
                     return None
-                kwargs[slot] = val
+                kwargs[slot] = cname
 
-        # Convert user-entered options into kwargs.
         for op in spec.option_params:
             val = self.option_values.get(op)
             if val is None:
@@ -876,47 +1309,50 @@ class App:
     def _is_figure_level(self, spec: PlotSpec) -> bool:
         return spec.name in {"jointplot", "pairplot", "relplot", "displot", "catplot", "lmplot", "clustermap"}
 
-    def _render_figure_to_surface(self, fig: Any) -> pygame.Surface:
-        canvas = fig.canvas
-        canvas.draw()
-        w, h = canvas.get_width_height()
-        raw = canvas.buffer_rgba()
+    def _render_figure_to_surface(self, fig) -> pygame.Surface:
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        raw = fig.canvas.buffer_rgba()
         surf = pygame.image.frombuffer(raw, (w, h), "RGBA")
         return surf.copy()
 
-    def _calculate_rf_regression(self, df: pd.DataFrame):
-        features = self.slot_values.get("feature_columns")
+    def _calculate_rf_regression(self, merged_df: pd.DataFrame):
+        feats = self.slot_values.get("feature_columns")
         target = self.slot_values.get("target_column")
 
-        if not isinstance(features, list) or not features:
-            self.status = "Random forest requires at least one feature column."
+        if not isinstance(feats, list) or not feats:
+            self.status = "Random forest requires feature_columns."
             return
-        if not isinstance(target, str) or not target:
-            self.status = "Random forest requires one target column."
-            return
-
-        missing = [c for c in features + [target] if c not in df.columns]
-        if missing:
-            self.status = f"Missing column(s): {', '.join(missing)}"
+        if not isinstance(target, str):
+            self.status = "Random forest requires target_column."
             return
 
-        model_kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+        feature_cols = []
+        for e in feats:
+            t, c = self.decode_col(e)
+            feature_cols.append(f"{t}.{c}" if t else c)
 
-        model = RandomForestRegressor(**model_kwargs)
+        t_t, t_c = self.decode_col(target)
+        target_col = f"{t_t}.{t_c}" if t_t else t_c
 
-        X = df[features]
-        y = df[target]
+        for c in feature_cols + [target_col]:
+            if c not in merged_df.columns:
+                self.status = f"RF column not found after join: {c}"
+                return
 
-        # Remove rows with nulls in model inputs.
+        X = merged_df[feature_cols]
+        y = merged_df[target_col]
+
         valid = X.notna().all(axis=1) & y.notna()
         X = X.loc[valid]
         y = y.loc[valid]
+
         if len(X) < 10:
             self.status = "Need at least 10 complete rows for RF regression."
             return
 
-        # "Stratified" CV for regression is approximated by quantile binning of y.
-        # If bins collapse or become invalid, fallback to standard KFold.
+        model_kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+
         try:
             bins = pd.qcut(y, q=5, labels=False, duplicates="drop")
             if bins.nunique() >= 2:
@@ -930,23 +1366,22 @@ class App:
             folds = splitter.split(X)
 
         scores: List[float] = []
-        for train_idx, test_idx in folds:
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            fold_model = RandomForestRegressor(**model_kwargs)
-            fold_model.fit(X_train, y_train)
-            scores.append(float(fold_model.score(X_test, y_test)))
+        for tr, te in folds:
+            m = RandomForestRegressor(**model_kwargs)
+            m.fit(X.iloc[tr], y.iloc[tr])
+            scores.append(float(m.score(X.iloc[te], y.iloc[te])))
 
-        # Fit final model on all valid data for feature importance plot.
-        model.fit(X, y)
-        importances = pd.Series(model.feature_importances_, index=features).sort_values(ascending=False)
+        final_model = RandomForestRegressor(**model_kwargs)
+        final_model.fit(X, y)
+
+        imp = pd.Series(final_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
 
         plt.close("all")
         fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
-        sns.barplot(x=importances.index.tolist(), y=importances.values.tolist(), ax=ax, color="#4da3ff")
+        sns.barplot(x=imp.index.tolist(), y=imp.values.tolist(), ax=ax, color="#4da3ff")
+        ax.tick_params(axis="x", rotation=35)
         ax.set_xlabel("Feature")
         ax.set_ylabel("Importance")
-        ax.tick_params(axis="x", rotation=35)
         ax.set_title(f"RF Feature Importances | Mean 5-fold R²: {np.mean(scores):.4f}")
         fig.tight_layout()
 
@@ -960,46 +1395,41 @@ class App:
             self.status = "Select a plot type first."
             return
 
-        if not self.selected_table:
-            self.status = "Select at least one column to establish active table."
-            return
-
-        df = self.dataframes.get(self.selected_table)
-        if df is None:
-            self.status = "Selected table no longer exists."
-            return
-
-        # Validate required slot assignments.
         for req in spec.required_slots:
-            val = self.slot_values.get(req)
-            if val is None or val == []:
+            v = self.slot_values.get(req)
+            if v is None or v == []:
                 self.status = f"Missing required input: {req}"
                 return
 
+        used_tables = self.gather_used_tables(spec)
+        merged_df, err = self.build_joined_dataframe(used_tables)
+        if merged_df is None:
+            self.status = err
+            return
+
         try:
             if spec.custom and spec.name == "rf_regression":
-                self._calculate_rf_regression(df)
+                self._calculate_rf_regression(merged_df)
                 return
 
-            kwargs = self._collect_seaborn_kwargs(spec, df)
+            kwargs = self._collect_seaborn_kwargs(spec, merged_df)
             if kwargs is None:
                 return
 
             plt.close("all")
             sns.set_style("whitegrid")
-
             fn = getattr(sns, spec.function_name or spec.name)
 
             if self._is_figure_level(spec):
-                grid = fn(data=df, **kwargs)
+                grid = fn(data=merged_df, **kwargs)
                 fig = grid.fig if hasattr(grid, "fig") else plt.gcf()
                 fig.set_size_inches(8, 3.2)
-                fig.suptitle(f"{spec.name} ({self.selected_table})")
+                fig.suptitle(spec.name)
                 fig.tight_layout()
             else:
                 fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
-                fn(data=df, ax=ax, **kwargs)
-                ax.set_title(f"{spec.name} ({self.selected_table})")
+                fn(data=merged_df, ax=ax, **kwargs)
+                ax.set_title(spec.name)
                 fig.tight_layout()
 
             self.chart_surface = self._render_figure_to_surface(fig)
@@ -1008,66 +1438,155 @@ class App:
         except Exception as e:
             self.status = f"Plot failed: {e}"
 
-    def clear_selection(self):
+    def clear_selection(self, clear_data: bool = False):
         self.selected_plot = None
         self.slot_values = {}
         self.option_values = {}
-        self.selected_table = None
         self.active_slot = None
         self.close_menu()
         self.close_input_dialog()
         self.chart_surface = None
-        self.status = "Cleared current builder state."
+        if clear_data:
+            self.dataframes = {}
+            self.table_collapsed = {}
+            self.relationships = []
+            self.source_files = []
+        self.status = "Cleared current selection."
 
     # ------------------------------
-    # Tooltip resolver
+    # Tooltip
     # ------------------------------
     def update_tooltip(self, pos: Tuple[int, int]):
         self.tooltip_text = ""
 
-        if self.load_btn.collidepoint(pos):
-            self.tooltip_text = "Open CSV/Excel/SQLite file."
-            return
-        if self.calc_btn.collidepoint(pos):
-            self.tooltip_text = "Generate plot preview from current settings."
-            return
-        if self.clear_btn.collidepoint(pos):
-            self.tooltip_text = "Clear plot selection and assignments."
-            return
+        for rect, text, _, action in self.menu_buttons:
+            if rect.collidepoint(pos):
+                tips = {
+                    "load_files": "Load one or more data files.",
+                    "save_plot": "Save current plot preview as PNG.",
+                    "relationships": "Open relationship editor for table joins.",
+                    "save_state": "Save app state to JSON.",
+                    "load_state": "Load app state from JSON.",
+                    "fullscreen": "Toggle fullscreen/windowed mode.",
+                    "calculate": "Generate plot using current inputs.",
+                    "clear": "Clear selected plot and inputs.",
+                }
+                self.tooltip_text = tips.get(action, text)
+                return
 
         for rect, kind, table, col in self.data_layout:
             if rect.collidepoint(pos):
-                if kind == "header":
-                    self.tooltip_text = f"Toggle table '{table}'"
+                self.tooltip_text = f"Table '{table}'" if kind == "header" else f"Column '{col}' in '{table}'"
+                return
+
+        for rect, kind, val in self.plot_layout:
+            if rect.collidepoint(pos):
+                if kind == "group":
+                    self.tooltip_text = f"Toggle {val} section"
                 else:
-                    self.tooltip_text = f"Column '{col}' from table '{table}'"
+                    self.tooltip_text = PLOT_DESCRIPTIONS.get(val, val)
                 return
 
-        for rect, plot_name in self.plot_layout:
+        for k, rect in self.slot_layout.items():
             if rect.collidepoint(pos):
-                self.tooltip_text = PLOT_DESCRIPTIONS.get(plot_name, plot_name)
+                self.tooltip_text = self.parameter_description(k)
                 return
 
-        spec = self.current_spec()
-        if not spec:
+        for k, rect in self.option_layout.items():
+            if rect.collidepoint(pos):
+                self.tooltip_text = self.parameter_description(k)
+                return
+
+    def draw_tooltip(self, mouse_pos: Tuple[int, int]):
+        if not self.tooltip_text:
             return
-
-        for slot, rect in self.slot_layout.items():
-            if rect.collidepoint(pos):
-                self.tooltip_text = self.parameter_description(slot)
-                return
-
-        for opt, rect in self.option_layout.items():
-            if rect.collidepoint(pos):
-                self.tooltip_text = self.parameter_description(opt)
-                return
+        pad = 7
+        txt = self.font_sm.render(self.tooltip_text, True, TEXT)
+        box = pygame.Rect(mouse_pos[0] + 14, mouse_pos[1] + 14, txt.get_width() + pad * 2, txt.get_height() + pad * 2)
+        if box.right > self.window_w - 6:
+            box.x = self.window_w - box.w - 6
+        if box.bottom > self.window_h - 6:
+            box.y = self.window_h - box.h - 6
+        pygame.draw.rect(self.screen, TOOLTIP_BG, box, border_radius=6)
+        pygame.draw.rect(self.screen, (120, 130, 150), box, width=1, border_radius=6)
+        self.screen.blit(txt, (box.x + pad, box.y + pad))
 
     # ------------------------------
     # Event handling
     # ------------------------------
-    def handle_mouse_down(self, pos: Tuple[int, int], button: int):
+    def handle_menu_action(self, action: str):
+        if action == "load_files":
+            self.load_files(self.open_files_picker(), append=True)
+        elif action == "save_plot":
+            self.save_plot()
+        elif action == "relationships":
+            self.rel_editor_open = True
+        elif action == "save_state":
+            self.save_state()
+        elif action == "load_state":
+            self.load_state()
+        elif action == "fullscreen":
+            self.toggle_fullscreen()
+        elif action == "calculate":
+            self.calculate_plot()
+        elif action == "clear":
+            self.clear_selection(clear_data=False)
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        if self.fullscreen:
+            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            self.screen = pygame.display.set_mode((DEFAULT_WINDOW_W, DEFAULT_WINDOW_H), pygame.RESIZABLE)
+        self.update_layout()
+        self.status = "Fullscreen enabled" if self.fullscreen else "Fullscreen disabled"
+
+    def handle_relationship_mouse_down(self, pos: Tuple[int, int], button: int):
         if button == 1:
-            # If a modal popup is active, consume click inside that popup first.
+            # Click line to cycle join mode.
+            for a, b, idx in self.rel_line_layout:
+                if self.point_to_segment_distance(pos, a, b) <= 6:
+                    self.cycle_join_mode(idx)
+                    return
+
+            # Begin relation drag from a column box.
+            for rect, table, col in self.rel_column_boxes:
+                if rect.collidepoint(pos):
+                    self.rel_drag_start = (table, col)
+                    return
+
+            # Click outside modal closes it.
+            if not self.rel_modal_rect.collidepoint(pos):
+                self.rel_editor_open = False
+                self.rel_drag_start = None
+
+        if button in (4, 5) and self.rel_modal_rect.collidepoint(pos):
+            dy = 1 if button == 4 else -1
+            self.rel_scroll_y -= dy * 30
+            self.rel_scroll_y = max(0, self.rel_scroll_y)
+
+    def handle_relationship_mouse_up(self, pos: Tuple[int, int], button: int):
+        if button != 1 or not self.rel_drag_start:
+            return
+
+        src_t, src_c = self.rel_drag_start
+        for rect, dst_t, dst_c in self.rel_column_boxes:
+            if rect.collidepoint(pos) and (dst_t != src_t or dst_c != src_c):
+                if not self.relation_exists(src_t, src_c, dst_t, dst_c):
+                    self.relationships.append(Relation(src_t, src_c, dst_t, dst_c, "inner"))
+                    self.status = f"Created relationship: {src_t}.{src_c} <-> {dst_t}.{dst_c}"
+                else:
+                    self.status = "Relationship already exists."
+                break
+
+        self.rel_drag_start = None
+
+    def handle_mouse_down(self, pos: Tuple[int, int], button: int):
+        if self.rel_editor_open:
+            self.handle_relationship_mouse_down(pos, button)
+            return
+
+        if button == 1:
             if self.menu_target:
                 for r, val in self.menu_items:
                     if r.collidepoint(pos):
@@ -1085,28 +1604,19 @@ class App:
                 return
 
             if self.input_target:
-                # Click outside closes typed dialog.
                 if self.input_rect and not self.input_rect.collidepoint(pos):
                     self.close_input_dialog()
                 return
 
-            if self.load_btn.collidepoint(pos):
-                path = self.open_file_picker()
-                if path:
-                    self.load_file(path)
-                return
-
-            if self.calc_btn.collidepoint(pos):
-                self.calculate_plot()
-                return
-
-            if self.clear_btn.collidepoint(pos):
-                self.clear_selection()
-                return
+            # Menu bar actions.
+            for rect, _, _, action in self.menu_buttons:
+                if rect.collidepoint(pos):
+                    self.handle_menu_action(action)
+                    return
 
             spec = self.current_spec()
 
-            # Click slot to make it active for direct column assignment.
+            # Slot rows select active input target.
             if spec:
                 for slot, rect in self.slot_layout.items():
                     if rect.collidepoint(pos):
@@ -1114,8 +1624,7 @@ class App:
                         self.status = f"Active input: {slot}"
                         return
 
-            # Clicking option rows opens fixed-choice menu or text dialog.
-            if spec:
+                # Optional param rows open fixed-choice menu or typed dialog.
                 for opt, rect in self.option_layout.items():
                     if rect.collidepoint(pos):
                         default = self.option_default(spec.name, opt)
@@ -1126,25 +1635,27 @@ class App:
                             self.open_input_dialog(opt, True, self.option_values.get(opt))
                         return
 
-            # Data panel click behavior (toggle headers / assign columns / begin drag).
+            # Data interactions.
             for rect, kind, table, col in self.data_layout:
                 if rect.collidepoint(pos):
                     if kind == "header":
                         self.table_collapsed[table] = not self.table_collapsed.get(table, False)
                         return
                     if kind == "column":
-                        if spec and self.active_slot:
+                        if spec and self.active_slot and self.active_slot not in spec.multi_slots:
                             self.assign_columns_to_slot(self.active_slot, table, [col])
                         else:
-                            # Allow drag sweep to capture multiple columns quickly.
                             self.drag_item = DragItem(kind="column", value=col, table=table, values=[col])
                             self.drag_pos = pos
                         return
 
-            # Plot type selection is now click-based for reliability.
-            for rect, plot_name in self.plot_layout:
+            # Plot panel interactions.
+            for rect, kind, value in self.plot_layout:
                 if rect.collidepoint(pos):
-                    self.select_plot(plot_name)
+                    if kind == "group":
+                        self.plot_groups[value]["collapsed"] = not self.plot_groups[value]["collapsed"]
+                    elif kind == "plot":
+                        self.select_plot(value)
                     return
 
         if button in (4, 5):
@@ -1153,10 +1664,16 @@ class App:
                 self.data_panel.wheel(dy)
             elif self.plot_type_rect.collidepoint(pos):
                 self.plot_panel.wheel(dy)
+            elif self.builder_rect.collidepoint(pos):
+                self.builder_panel.wheel(dy)
             elif self.options_rect.collidepoint(pos):
                 self.options_panel.wheel(dy)
 
     def handle_mouse_up(self, pos: Tuple[int, int], button: int):
+        if self.rel_editor_open:
+            self.handle_relationship_mouse_up(pos, button)
+            return
+
         if button != 1 or not self.drag_item:
             return
 
@@ -1174,7 +1691,9 @@ class App:
         self.drag_pos = pos
         self.update_tooltip(pos)
 
-        # When left-dragging a column, add any hovered column from same table to drag bundle.
+        if self.rel_editor_open:
+            return
+
         if not self.drag_item or self.drag_item.kind != "column" or not buttons[0]:
             return
 
@@ -1182,20 +1701,28 @@ class App:
         if not table:
             return
 
-        for rect, kind, item_table, col in self.data_layout:
-            if kind == "column" and item_table == table and rect.collidepoint(pos):
+        for rect, kind, t, col in self.data_layout:
+            if kind == "column" and t == table and rect.collidepoint(pos):
                 if col not in self.drag_item.values:
                     self.drag_item.values.append(col)
-                return
+                break
 
     def handle_key_down(self, event: pygame.event.Event):
+        if self.rel_editor_open and event.key == pygame.K_ESCAPE:
+            self.rel_editor_open = False
+            self.rel_drag_start = None
+            return
+
+        if event.key == pygame.K_F11:
+            self.toggle_fullscreen()
+            return
+
         if not self.input_target:
             return
 
         if event.key == pygame.K_ESCAPE:
             self.close_input_dialog()
             return
-
         if event.key == pygame.K_RETURN:
             name, is_option = self.input_target
             parsed = self.parse_input_value(self.input_value)
@@ -1207,12 +1734,9 @@ class App:
             self.status = f"Set {name} = {parsed}"
             self.close_input_dialog()
             return
-
         if event.key == pygame.K_BACKSPACE:
             self.input_value = self.input_value[:-1]
             return
-
-        # Basic text entry for arbitrary values.
         if event.unicode and event.unicode.isprintable():
             self.input_value += event.unicode
 
@@ -1225,6 +1749,9 @@ class App:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.VIDEORESIZE and not self.fullscreen:
+                    self.screen = pygame.display.set_mode((max(1200, event.w), max(760, event.h)), pygame.RESIZABLE)
+                    self.update_layout()
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     self.handle_mouse_down(event.pos, event.button)
                 elif event.type == pygame.MOUSEBUTTONUP:
@@ -1235,10 +1762,7 @@ class App:
                     self.handle_key_down(event)
 
             self.screen.fill(BG)
-            self.draw_button(self.load_btn, "Load File", ACCENT)
-            self.draw_button(self.calc_btn, "Calculate", GOOD)
-            self.draw_button(self.clear_btn, "Clear", WARN)
-
+            self.draw_menu_bar()
             self.draw_data_panel()
             self.draw_plot_type_panel()
             self.draw_builder_area()
@@ -1248,6 +1772,7 @@ class App:
             self.draw_dragging()
             self.draw_menu_popup()
             self.draw_input_dialog()
+            self.draw_relationship_editor()
             self.draw_tooltip(pygame.mouse.get_pos())
 
             pygame.display.flip()
