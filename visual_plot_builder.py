@@ -13,12 +13,15 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
+from pandas.plotting import parallel_coordinates
 import pygame
 import seaborn as sns
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.manifold import TSNE
 
 try:
     from scipy.cluster.hierarchy import dendrogram, linkage
@@ -177,6 +180,15 @@ PLOT_PARAM_OVERRIDES: Dict[str, Dict[str, List[Any]]] = {
         "covariance_type": ["full", "tied", "diag", "spherical"],
         "init_params": ["kmeans", "k-means++", "random", "random_from_data"],
     },
+    "pca_plot": {
+        "svd_solver": ["auto", "full", "covariance_eigh", "arpack", "randomized"],
+        "whiten": [True, False],
+    },
+    "tsne_plot": {
+        "method": ["barnes_hut", "exact"],
+        "init": ["pca", "random"],
+        "metric": ["euclidean", "cosine", "manhattan"],
+    },
 }
 
 PLOT_DESCRIPTIONS = {
@@ -208,6 +220,10 @@ PLOT_DESCRIPTIONS = {
     "dendrogram": "Hierarchical clustering dendrogram from selected numeric columns.",
     "kmeans_cluster": "KMeans clustering on one or two columns with grouped distribution/relationship plot.",
     "gaussian_mixture": "Gaussian Mixture clustering on one or two columns with optional 2D 1-sigma contours.",
+    "quiver_plot": "Vector field gradient plot built from x/y grid positions and z values.",
+    "parallel_lines": "Parallel coordinates plot for multiple features with optional class grouping.",
+    "pca_plot": "PCA projection to two dimensions from selected feature columns.",
+    "tsne_plot": "t-SNE projection to two dimensions from selected feature columns.",
 }
 
 PARAM_DESCRIPTIONS = {
@@ -227,6 +243,9 @@ PARAM_DESCRIPTIONS = {
     "feature_columns": "Input feature columns for random forest regression.",
     "target_column": "Single output/target column for random forest regression.",
     "data_columns": "One or two numeric input columns used for clustering plots.",
+    "class_column": "Optional class/group column used for coloring/grouping.",
+    "feature_columns": "Input feature columns.",
+    "z": "Value column used for grid cell intensity.",
 }
 
 
@@ -262,6 +281,15 @@ class Relation:
     right_col: str
     join_mode: str = "inner"
     click_count: int = 0
+
+
+@dataclass
+class TableSource:
+    kind: str  # "memory" | "sqlite"
+    name: str
+    columns: List[str]
+    file_path: Optional[str] = None
+    sqlite_table: Optional[str] = None
 
 
 class ScrollPanel:
@@ -330,6 +358,14 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
     for plot_name in SEABORN_PLOT_FUNCS:
         if hasattr(sns, plot_name):
             specs[plot_name] = _build_seaborn_spec(plot_name)
+
+    for grid_plot in ("heatmap", "clustermap"):
+        if grid_plot in specs:
+            specs[grid_plot].required_slots = ["x", "y", "z"]
+            specs[grid_plot].column_slots = ["x", "y", "z"]
+            specs[grid_plot].multi_slots = set()
+            specs[grid_plot].custom = True
+            specs[grid_plot].function_name = None
 
     rf_sig = inspect.signature(RandomForestRegressor)
     rf_options: List[str] = []
@@ -406,6 +442,70 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
         group="AI Analysis",
     )
 
+    pca_sig = inspect.signature(PCA)
+    pca_options: List[str] = []
+    for pname, param in pca_sig.parameters.items():
+        if pname == "self":
+            continue
+        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+            continue
+        pca_options.append(pname)
+    specs["pca_plot"] = PlotSpec(
+        name="pca_plot",
+        description=PLOT_DESCRIPTIONS["pca_plot"],
+        required_slots=["feature_columns"],
+        column_slots=["feature_columns", "class_column"],
+        multi_slots={"feature_columns"},
+        option_params=pca_options,
+        function_name=None,
+        custom=True,
+        group="AI Analysis",
+    )
+
+    tsne_sig = inspect.signature(TSNE)
+    tsne_options: List[str] = []
+    for pname, param in tsne_sig.parameters.items():
+        if pname == "self":
+            continue
+        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+            continue
+        tsne_options.append(pname)
+    specs["tsne_plot"] = PlotSpec(
+        name="tsne_plot",
+        description=PLOT_DESCRIPTIONS["tsne_plot"],
+        required_slots=["feature_columns"],
+        column_slots=["feature_columns", "class_column"],
+        multi_slots={"feature_columns"},
+        option_params=tsne_options,
+        function_name=None,
+        custom=True,
+        group="AI Analysis",
+    )
+
+    specs["quiver_plot"] = PlotSpec(
+        name="quiver_plot",
+        description=PLOT_DESCRIPTIONS["quiver_plot"],
+        required_slots=["x", "y", "z"],
+        column_slots=["x", "y", "z"],
+        multi_slots=set(),
+        option_params=[],
+        function_name=None,
+        custom=True,
+        group="Seaborn Plots",
+    )
+
+    specs["parallel_lines"] = PlotSpec(
+        name="parallel_lines",
+        description=PLOT_DESCRIPTIONS["parallel_lines"],
+        required_slots=["feature_columns"],
+        column_slots=["feature_columns", "class_column"],
+        multi_slots={"feature_columns"},
+        option_params=[],
+        function_name=None,
+        custom=True,
+        group="Seaborn Plots",
+    )
+
     return specs
 
 
@@ -433,6 +533,7 @@ class App:
         self._current_menu_values: List[Any] = []
 
         self.dataframes: Dict[str, pd.DataFrame] = {}
+        self.table_sources: Dict[str, TableSource] = {}
         self.table_collapsed: Dict[str, bool] = {}
         self.data_layout: List[Tuple[pygame.Rect, str, str, str]] = []
         self.plot_layout: List[Tuple[pygame.Rect, str, str]] = []  # (rect, kind, value)
@@ -444,6 +545,8 @@ class App:
         self.option_values: Dict[str, Any] = {}
         self.active_slot: Optional[str] = None
         self.last_multi_anchor: Optional[Tuple[str, str]] = None
+        self.input_header_layout: Dict[str, pygame.Rect] = {}
+        self.input_sections = {"required": False, "optional": False}
 
         self.drag_item: Optional[DragItem] = None
         self.drag_pos = (0, 0)
@@ -475,6 +578,12 @@ class App:
         self.rel_canvas_rect = pygame.Rect(0, 0, 0, 0)
         self.rel_clear_btn = pygame.Rect(0, 0, 0, 0)
 
+        # Splitter-based resizing state.
+        self.left_panel_w = 420
+        self.right_panel_w = 320
+        self.builder_h = 430
+        self.resizing_panel: Optional[str] = None
+
         self.update_layout()
 
     # ------------------------------
@@ -486,20 +595,30 @@ class App:
         # Top menu bar occupies fixed height and hosts all control actions.
         self.menu_bar_rect = pygame.Rect(0, 0, self.window_w, 50)
 
-        self.data_rect = pygame.Rect(12, 62, 420, self.window_h - 74)
-        self.plot_type_rect = pygame.Rect(self.window_w - 332, 62, 320, self.window_h - 74)
+        self.left_panel_w = int(max(260, min(self.left_panel_w, self.window_w - 760)))
+        self.right_panel_w = int(max(240, min(self.right_panel_w, self.window_w - self.left_panel_w - 360)))
+
+        self.data_rect = pygame.Rect(12, 62, self.left_panel_w, self.window_h - 74)
+        self.plot_type_rect = pygame.Rect(self.window_w - self.right_panel_w - 12, 62, self.right_panel_w, self.window_h - 74)
 
         center_x = self.data_rect.right + 12
         center_w = self.plot_type_rect.left - center_x - 12
+        center_w = max(360, center_w)
 
-        self.builder_rect = pygame.Rect(center_x, 62, center_w, 300)
-        self.chart_rect = pygame.Rect(center_x, self.builder_rect.bottom + 10, center_w, 255)
-        self.options_rect = pygame.Rect(center_x, self.chart_rect.bottom + 10, center_w, self.window_h - (self.chart_rect.bottom + 22))
+        max_builder_h = self.window_h - 230
+        self.builder_h = int(max(220, min(self.builder_h, max_builder_h)))
+        self.builder_rect = pygame.Rect(center_x, 62, center_w, self.builder_h)
+        self.chart_rect = pygame.Rect(center_x, self.builder_rect.bottom + 10, center_w, self.window_h - self.builder_rect.bottom - 22)
+        self.options_rect = pygame.Rect(0, 0, 0, 0)
+
+        self.left_splitter = pygame.Rect(self.data_rect.right + 4, self.data_rect.y, 8, self.data_rect.h)
+        self.right_splitter = pygame.Rect(self.plot_type_rect.x - 8, self.plot_type_rect.y, 8, self.plot_type_rect.h)
+        self.middle_splitter = pygame.Rect(self.builder_rect.x, self.builder_rect.bottom + 3, self.builder_rect.w, 8)
 
         self.data_panel = ScrollPanel(self.data_rect.inflate(-10, -10))
         self.plot_panel = ScrollPanel(self.plot_type_rect.inflate(-10, -10))
         self.builder_panel = ScrollPanel(pygame.Rect(self.builder_rect.x + 10, self.builder_rect.y + 92, self.builder_rect.w - 20, self.builder_rect.h - 102))
-        self.options_panel = ScrollPanel(pygame.Rect(self.options_rect.x + 10, self.options_rect.y + 40, self.options_rect.w - 20, self.options_rect.h - 50))
+        self.options_panel = ScrollPanel(pygame.Rect(0, 0, 0, 0))
 
         self._build_menu_buttons()
 
@@ -596,6 +715,27 @@ class App:
             n += 1
         return f"{base_name}_{n}"
 
+    def fetch_table_dataframe(self, table: str, needed_cols: Optional[List[str]] = None) -> pd.DataFrame:
+        src = self.table_sources.get(table)
+        if src is None:
+            return self.dataframes.get(table, pd.DataFrame()).copy()
+        if src.kind == "memory":
+            df = self.dataframes.get(table, pd.DataFrame()).copy()
+            if needed_cols:
+                keep = [c for c in needed_cols if c in df.columns]
+                return df[keep].copy()
+            return df
+        if src.kind == "sqlite" and src.file_path and src.sqlite_table:
+            cols = needed_cols if needed_cols else src.columns
+            quoted = ", ".join([f'"{c}"' for c in cols])
+            query = f'SELECT {quoted} FROM "{src.sqlite_table}"'
+            conn = sqlite3.connect(src.file_path)
+            try:
+                return pd.read_sql_query(query, conn)
+            finally:
+                conn.close()
+        return pd.DataFrame(columns=src.columns)
+
     def load_file(self, path: str, append: bool = True) -> bool:
         ext = os.path.splitext(path)[1].lower()
         new_data: Dict[str, pd.DataFrame] = {}
@@ -616,7 +756,9 @@ class App:
                         conn,
                     )["name"].tolist()
                     for table in table_names:
-                        new_data[str(table)] = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
+                        col_rows = pd.read_sql_query(f'PRAGMA table_info("{table}")', conn)
+                        cols = [str(c) for c in col_rows["name"].tolist()]
+                        new_data[str(table)] = pd.DataFrame(columns=cols)
                 finally:
                     conn.close()
             else:
@@ -632,6 +774,7 @@ class App:
 
         if not append:
             self.dataframes = {}
+            self.table_sources = {}
             self.table_collapsed = {}
             self.relationships = []
 
@@ -640,6 +783,20 @@ class App:
             unique = self._unique_table_name(name)
             self.dataframes[unique] = df
             self.table_collapsed[unique] = False
+            if ext in {".db", ".sqlite", ".sqlite3"}:
+                self.table_sources[unique] = TableSource(
+                    kind="sqlite",
+                    name=unique,
+                    columns=[str(c) for c in df.columns.tolist()],
+                    file_path=path,
+                    sqlite_table=name,
+                )
+            else:
+                self.table_sources[unique] = TableSource(
+                    kind="memory",
+                    name=unique,
+                    columns=[str(c) for c in df.columns.tolist()],
+                )
             count += 1
 
         if path not in self.source_files:
@@ -790,6 +947,10 @@ class App:
             return inspect.signature(KMeans).parameters[opt].default
         if plot_name == "gaussian_mixture":
             return inspect.signature(GaussianMixture).parameters[opt].default
+        if plot_name == "pca_plot":
+            return inspect.signature(PCA).parameters[opt].default
+        if plot_name == "tsne_plot":
+            return inspect.signature(TSNE).parameters[opt].default
         if plot_name == "dendrogram":
             defaults = {
                 "method": "ward",
@@ -1020,12 +1181,14 @@ class App:
     def draw_builder_area(self):
         pygame.draw.rect(self.screen, PANEL, self.builder_rect, border_radius=10)
         pygame.draw.rect(self.screen, (255, 255, 255), self.builder_rect, width=1, border_radius=10)
-        self.draw_text("Builder", (self.builder_rect.x + 12, self.builder_rect.y + 8), font=self.font_lg)
+        self.draw_text("Inputs", (self.builder_rect.x + 12, self.builder_rect.y + 8), font=self.font_lg)
 
         spec = self.current_spec()
         header_y = self.builder_rect.y + 34
 
         self.slot_layout = {}
+        self.option_layout = {}
+        self.input_header_layout = {}
         if not spec:
             self.draw_text("Select a plot from the right panel.", (self.builder_rect.x + 12, header_y), MUTED, self.font_sm)
             return
@@ -1041,27 +1204,59 @@ class App:
         prev_clip = self.screen.get_clip()
         self.screen.set_clip(viewport)
 
-        for slot in spec.column_slots:
-            s_rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, 38)
-            if viewport.colliderect(s_rect):
-                pygame.draw.rect(self.screen, (66, 72, 88), s_rect, border_radius=8)
-                border = ACCENT if slot == self.active_slot else (120, 130, 150)
-                pygame.draw.rect(self.screen, border, s_rect, width=1, border_radius=8)
+        req_header = pygame.Rect(viewport.x + 8, y, viewport.w - 16, 28)
+        if viewport.colliderect(req_header):
+            pygame.draw.rect(self.screen, (48, 53, 64), req_header, border_radius=6)
+            marker = "+" if self.input_sections["required"] else "-"
+            self.draw_text(f"{marker} Required Inputs", (req_header.x + 8, req_header.y + 6), font=self.font_sm)
+        self.input_header_layout["required"] = req_header
+        y += 32
 
-                val = self.slot_values.get(slot)
-                if isinstance(val, list):
-                    shown = ", ".join([f"{self.decode_col(v)[0]}.{self.decode_col(v)[1]}" for v in val]) if val else "[unset]"
-                elif isinstance(val, str):
-                    t, c = self.decode_col(val)
-                    shown = f"{t}.{c}"
-                else:
-                    shown = "[unset]"
+        if not self.input_sections["required"]:
+            for slot in spec.column_slots:
+                s_rect = pygame.Rect(viewport.x + 8, y, viewport.w - 16, 38)
+                if viewport.colliderect(s_rect):
+                    pygame.draw.rect(self.screen, (66, 72, 88), s_rect, border_radius=8)
+                    border = ACCENT if slot == self.active_slot else (120, 130, 150)
+                    pygame.draw.rect(self.screen, border, s_rect, width=1, border_radius=8)
 
-                req = "*" if slot in spec.required_slots else ""
-                text = f"{slot}{req}: {shown}"
-                self.draw_text(self.clip_text(text, s_rect.w - 12, self.font_sm), (s_rect.x + 8, s_rect.y + 10), font=self.font_sm)
-            self.slot_layout[slot] = s_rect
-            y += 44
+                    val = self.slot_values.get(slot)
+                    if isinstance(val, list):
+                        shown = ", ".join([f"{self.decode_col(v)[0]}.{self.decode_col(v)[1]}" for v in val]) if val else "[default]"
+                    elif isinstance(val, str):
+                        t, c = self.decode_col(val)
+                        shown = f"{t}.{c}"
+                    else:
+                        shown = "[default]"
+
+                    req = "*" if slot in spec.required_slots else ""
+                    text = f"{slot}{req}: {shown}"
+                    self.draw_text(self.clip_text(text, s_rect.w - 12, self.font_sm), (s_rect.x + 8, s_rect.y + 10), font=self.font_sm)
+                self.slot_layout[slot] = s_rect
+                y += 44
+
+        opt_header = pygame.Rect(viewport.x + 8, y, viewport.w - 16, 28)
+        if viewport.colliderect(opt_header):
+            pygame.draw.rect(self.screen, (48, 53, 64), opt_header, border_radius=6)
+            marker = "+" if self.input_sections["optional"] else "-"
+            self.draw_text(f"{marker} Optional Inputs", (opt_header.x + 8, opt_header.y + 6), font=self.font_sm)
+        self.input_header_layout["optional"] = opt_header
+        y += 32
+
+        if not self.input_sections["optional"]:
+            for opt in spec.option_params:
+                r = pygame.Rect(viewport.x + 8, y, viewport.w - 16, 32)
+                if viewport.colliderect(r):
+                    pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=6)
+                    val = self.option_values.get(opt)
+                    default_val = self.option_default(spec.name, opt)
+                    shown_val = default_val if val is None else val
+                    border_col = ACCENT if val is not None else (120, 130, 150)
+                    pygame.draw.rect(self.screen, border_col, r, width=1, border_radius=6)
+                    txt = f"{opt}: {shown_val}"
+                    self.draw_text(self.clip_text(txt, r.w - 10, self.font_sm), (r.x + 8, r.y + 7), font=self.font_sm)
+                self.option_layout[opt] = r
+                y += 36
 
         self.screen.set_clip(prev_clip)
 
@@ -1128,6 +1323,11 @@ class App:
         pygame.draw.rect(self.screen, (40, 44, 54), rect, border_radius=8)
         txt = self.clip_text(self.status, rect.w - 12, self.font_sm)
         self.draw_text(txt, (rect.x + 6, rect.y + 8), MUTED, self.font_sm)
+
+    def draw_splitters(self):
+        pygame.draw.rect(self.screen, (80, 86, 98), self.left_splitter, border_radius=3)
+        pygame.draw.rect(self.screen, (80, 86, 98), self.right_splitter, border_radius=3)
+        pygame.draw.rect(self.screen, (80, 86, 98), self.middle_splitter, border_radius=3)
 
     def draw_dragging(self):
         if not self.drag_item:
@@ -1443,10 +1643,80 @@ class App:
             used_tables = {next(iter(self.dataframes.keys()))}
 
         root = next(iter(used_tables))
-        if root not in self.dataframes:
+        if root not in self.table_sources:
             return None, f"Table '{root}' not found."
 
-        current = self.dataframes[root].copy()
+        # SQLite lazy path: every plotting request issues fresh SQL and joins through temp views.
+        sqlite_paths = {self.table_sources[t].file_path for t in used_tables if self.table_sources.get(t) and self.table_sources[t].kind == "sqlite"}
+        all_sqlite = len(sqlite_paths) == 1 and len(used_tables) == len([t for t in used_tables if self.table_sources[t].kind == "sqlite"])
+        if all_sqlite:
+            db_path = next(iter(sqlite_paths))
+            if db_path:
+                conn = sqlite3.connect(db_path)
+                try:
+                    table_views: Dict[str, str] = {}
+                    for idx, t in enumerate(sorted(used_tables)):
+                        src = self.table_sources[t]
+                        vname = f"_src_{idx}"
+                        select_parts = [f'"{c}" AS "{t}.{c}"' for c in src.columns]
+                        conn.execute(f'DROP VIEW IF EXISTS "{vname}"')
+                        conn.execute(
+                            f'CREATE TEMP VIEW "{vname}" AS SELECT {", ".join(select_parts)} FROM "{src.sqlite_table}"'
+                        )
+                        table_views[t] = vname
+
+                    current_view = table_views[root]
+                    in_graph = {root}
+                    pending = set(used_tables) - in_graph
+                    join_idx = 0
+
+                    while pending:
+                        merged_any = False
+                        for table in list(pending):
+                            connector = None
+                            reverse = False
+                            for rel in self.relationships:
+                                if rel.left_table in in_graph and rel.right_table == table:
+                                    connector = rel
+                                    reverse = False
+                                    break
+                                if rel.right_table in in_graph and rel.left_table == table:
+                                    connector = rel
+                                    reverse = True
+                                    break
+                            if connector is None:
+                                continue
+
+                            if not reverse:
+                                left_key = f"{connector.left_table}.{connector.left_col}"
+                                right_key = f"{connector.right_table}.{connector.right_col}"
+                                how = connector.join_mode.upper()
+                            else:
+                                left_key = f"{connector.right_table}.{connector.right_col}"
+                                right_key = f"{connector.left_table}.{connector.left_col}"
+                                how = self._reverse_join_mode(connector.join_mode).upper()
+
+                            next_view = f"_join_{join_idx}"
+                            join_idx += 1
+                            conn.execute(f'DROP VIEW IF EXISTS "{next_view}"')
+                            conn.execute(
+                                f'CREATE TEMP VIEW "{next_view}" AS '
+                                f'SELECT j.*, t.* FROM "{current_view}" j '
+                                f'{how} JOIN "{table_views[table]}" t ON j."{left_key}" = t."{right_key}"'
+                            )
+                            current_view = next_view
+                            in_graph.add(table)
+                            pending.remove(table)
+                            merged_any = True
+
+                        if not merged_any:
+                            return None, "Selected tables are not fully connected by relationships."
+
+                    return pd.read_sql_query(f'SELECT * FROM "{current_view}"', conn), ""
+                finally:
+                    conn.close()
+
+        current = self.fetch_table_dataframe(root)
         current.columns = [f"{root}.{c}" for c in current.columns]
         in_graph = {root}
 
@@ -1469,7 +1739,7 @@ class App:
                 if connector is None:
                     continue
 
-                new_df = self.dataframes[table].copy()
+                new_df = self.fetch_table_dataframe(table)
                 new_df.columns = [f"{table}.{c}" for c in new_df.columns]
 
                 if not reverse:
@@ -1621,15 +1891,36 @@ class App:
                 seen[base] = 1
             display_labels.append(base)
 
+        accuracy = float(np.mean(scores))
+        accuracy = max(0.0, min(1.0, accuracy))
+
         plt.close("all")
-        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
-        ax.bar(range(len(imp)), imp.values.tolist(), color="#4da3ff")
-        ax.set_xticks(range(len(display_labels)))
-        ax.set_xticklabels(display_labels, rotation=35, ha="right")
-        ax.tick_params(axis="x", rotation=35)
-        ax.set_xlabel("Feature")
-        ax.set_ylabel("Importance")
-        ax.set_title(f"RF Feature Importances | Mean 5-fold R²: {np.mean(scores):.4f}")
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            2, 1, figsize=(8, 3.8), dpi=120, gridspec_kw={"height_ratios": [1.1, 2.2]}
+        )
+
+        # Top accuracy bar from 0% to 100%.
+        ax_top.barh([0], [100], color="#2a2f3a", alpha=0.55, edgecolor="white")
+        ax_top.barh([0], [accuracy * 100], color="#4da3ff", edgecolor="white")
+        ax_top.set_xlim(0, 100)
+        ax_top.set_yticks([])
+        ax_top.set_xlabel("Model Accuracy (%)")
+        ax_top.set_title(f"Random Forest Overall Accuracy: {accuracy * 100:.1f}%")
+
+        # Bottom flow-like stacked contribution bar.
+        contrib = imp / max(imp.sum(), 1e-12) * (accuracy * 100)
+        left = 0.0
+        colors = sns.color_palette("Blues", n_colors=max(3, len(contrib) + 2))[2:]
+        for i, (name, val) in enumerate(contrib.items()):
+            ax_bottom.barh([0], [val], left=left, color=colors[i % len(colors)], edgecolor="white")
+            if val > 3:
+                ax_bottom.text(left + val / 2, 0, display_labels[i], ha="center", va="center", color="white", fontsize=8)
+            left += val
+        ax_bottom.barh([0], [100 - accuracy * 100], left=accuracy * 100, color="#2a2f3a", alpha=0.35, edgecolor="white")
+        ax_bottom.set_xlim(0, 100)
+        ax_bottom.set_yticks([])
+        ax_bottom.set_xlabel("Feature Contribution Flow To Accuracy (%)")
+        ax_bottom.set_title("Feature Importance Flow")
         fig.tight_layout()
 
         self.chart_surface = self._render_figure_to_surface(fig)
@@ -1646,6 +1937,12 @@ class App:
             if cname in merged_df.columns:
                 cols.append(cname)
         return cols
+
+    def _resolve_single_slot_column(self, merged_df: pd.DataFrame, slot_name: str) -> Optional[str]:
+        cols = self._resolve_slot_columns(merged_df, slot_name)
+        if cols:
+            return cols[0]
+        return None
 
     def _calculate_dendrogram(self, merged_df: pd.DataFrame):
         if dendrogram is None or linkage is None:
@@ -1685,7 +1982,7 @@ class App:
             ax=ax,
             orientation=orientation,
             truncate_mode=truncate_mode,
-            p=p if isinstance(p, int) else None,
+            p=30,
             leaf_rotation=leaf_rotation if leaf_rotation is not None else 0,
             leaf_font_size=leaf_font_size if leaf_font_size is not None else 9,
             no_labels=True,
@@ -1789,6 +2086,144 @@ class App:
         plt.close(fig)
         self.status = "Gaussian mixture plot generated successfully."
 
+    def _calculate_grid_plot(self, merged_df: pd.DataFrame, kind: str):
+        x_col = self._resolve_single_slot_column(merged_df, "x")
+        y_col = self._resolve_single_slot_column(merged_df, "y")
+        z_col = self._resolve_single_slot_column(merged_df, "z")
+        if not x_col or not y_col or not z_col:
+            self.status = f"{kind} requires x, y, and z."
+            return
+
+        data = merged_df[[x_col, y_col, z_col]].copy()
+        data[z_col] = pd.to_numeric(data[z_col], errors="coerce")
+        data = data.replace([np.inf, -np.inf], np.nan).dropna()
+        if data.empty:
+            self.status = f"{kind} requires numeric z data."
+            return
+
+        grid = data.pivot_table(index=y_col, columns=x_col, values=z_col, aggfunc="mean")
+        if grid.empty:
+            self.status = f"{kind} grid is empty after pivot."
+            return
+
+        plt.close("all")
+        if kind == "heatmap":
+            fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+            sns.heatmap(grid, ax=ax)
+            ax.set_title("Heatmap")
+            fig.tight_layout()
+        elif kind == "clustermap":
+            g = sns.clustermap(grid)
+            fig = g.fig
+            fig.set_size_inches(8, 3.2)
+            fig.suptitle("Clustermap")
+            fig.tight_layout()
+        else:
+            fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+            arr = grid.values
+            gy, gx = np.gradient(arr)
+            xx, yy = np.meshgrid(np.arange(arr.shape[1]), np.arange(arr.shape[0]))
+            ax.quiver(xx, yy, gx, gy, arr, cmap="viridis")
+            ax.invert_yaxis()
+            ax.set_title("Quiver Plot (Grid Gradient)")
+            fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = f"{kind} generated successfully."
+
+    def _calculate_parallel_lines(self, merged_df: pd.DataFrame):
+        feature_cols = self._resolve_slot_columns(merged_df, "feature_columns")
+        if len(feature_cols) < 2:
+            self.status = "parallel_lines requires at least two feature_columns."
+            return
+        class_col = self._resolve_single_slot_column(merged_df, "class_column")
+        cols = feature_cols + ([class_col] if class_col else [])
+        df = merged_df[cols].copy().dropna()
+        if df.empty:
+            self.status = "parallel_lines has no complete rows."
+            return
+        if class_col is None:
+            class_col = "_group"
+            df[class_col] = "all"
+        for c in feature_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna()
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        parallel_coordinates(df, class_col=class_col, cols=feature_cols, ax=ax, alpha=0.45)
+        ax.set_title("Parallel Lines Plot")
+        ax.tick_params(axis="x", rotation=25)
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "parallel_lines generated successfully."
+
+    def _calculate_pca_plot(self, merged_df: pd.DataFrame):
+        feature_cols = self._resolve_slot_columns(merged_df, "feature_columns")
+        if len(feature_cols) < 2:
+            self.status = "pca_plot requires at least two feature_columns."
+            return
+        class_col = self._resolve_single_slot_column(merged_df, "class_column")
+        df = merged_df[feature_cols + ([class_col] if class_col else [])].copy().dropna()
+        if df.empty:
+            self.status = "pca_plot has no complete rows."
+            return
+        X = df[feature_cols].apply(pd.to_numeric, errors="coerce").dropna()
+        if X.empty:
+            self.status = "pca_plot requires numeric feature columns."
+            return
+        kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+        kwargs["n_components"] = 2
+        model = PCA(**kwargs)
+        emb = model.fit_transform(X.values)
+        out = pd.DataFrame({"PC1": emb[:, 0], "PC2": emb[:, 1]})
+        if class_col and class_col in df.columns:
+            out["class"] = df.loc[X.index, class_col].astype(str)
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        if "class" in out:
+            sns.scatterplot(data=out, x="PC1", y="PC2", hue="class", ax=ax)
+        else:
+            sns.scatterplot(data=out, x="PC1", y="PC2", ax=ax)
+        ax.set_title("PCA Plot")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "pca_plot generated successfully."
+
+    def _calculate_tsne_plot(self, merged_df: pd.DataFrame):
+        feature_cols = self._resolve_slot_columns(merged_df, "feature_columns")
+        if len(feature_cols) < 2:
+            self.status = "tsne_plot requires at least two feature_columns."
+            return
+        class_col = self._resolve_single_slot_column(merged_df, "class_column")
+        df = merged_df[feature_cols + ([class_col] if class_col else [])].copy().dropna()
+        if df.empty:
+            self.status = "tsne_plot has no complete rows."
+            return
+        X = df[feature_cols].apply(pd.to_numeric, errors="coerce").dropna()
+        if X.empty:
+            self.status = "tsne_plot requires numeric feature columns."
+            return
+        kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+        kwargs["n_components"] = 2
+        model = TSNE(**kwargs)
+        emb = model.fit_transform(X.values)
+        out = pd.DataFrame({"TSNE1": emb[:, 0], "TSNE2": emb[:, 1]})
+        if class_col and class_col in df.columns:
+            out["class"] = df.loc[X.index, class_col].astype(str)
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        if "class" in out:
+            sns.scatterplot(data=out, x="TSNE1", y="TSNE2", hue="class", ax=ax)
+        else:
+            sns.scatterplot(data=out, x="TSNE1", y="TSNE2", ax=ax)
+        ax.set_title("t-SNE Plot")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "tsne_plot generated successfully."
+
     def calculate_plot(self):
         spec = self.current_spec()
         if not spec:
@@ -1820,6 +2255,18 @@ class App:
                     return
                 if spec.name == "gaussian_mixture":
                     self._calculate_gaussian_mixture(merged_df)
+                    return
+                if spec.name in {"heatmap", "clustermap", "quiver_plot"}:
+                    self._calculate_grid_plot(merged_df, spec.name)
+                    return
+                if spec.name == "parallel_lines":
+                    self._calculate_parallel_lines(merged_df)
+                    return
+                if spec.name == "pca_plot":
+                    self._calculate_pca_plot(merged_df)
+                    return
+                if spec.name == "tsne_plot":
+                    self._calculate_tsne_plot(merged_df)
                     return
 
             kwargs = self._collect_seaborn_kwargs(spec, merged_df)
@@ -1858,6 +2305,7 @@ class App:
         self.chart_surface = None
         if clear_data:
             self.dataframes = {}
+            self.table_sources = {}
             self.table_collapsed = {}
             self.relationships = []
             self.source_files = []
@@ -2002,6 +2450,16 @@ class App:
             return
 
         if button == 1:
+            if self.left_splitter.collidepoint(pos):
+                self.resizing_panel = "left"
+                return
+            if self.right_splitter.collidepoint(pos):
+                self.resizing_panel = "right"
+                return
+            if self.middle_splitter.collidepoint(pos):
+                self.resizing_panel = "middle"
+                return
+
             if self.menu_target:
                 for r, val in self.menu_items:
                     if r.collidepoint(pos):
@@ -2023,13 +2481,12 @@ class App:
                     self.close_input_dialog()
                 return
 
-            # Menu bar actions.
-            for rect, _, _, action in self.menu_buttons:
-                if rect.collidepoint(pos):
-                    self.handle_menu_action(action)
-                    return
-
             spec = self.current_spec()
+
+            for section, r in self.input_header_layout.items():
+                if r.collidepoint(pos):
+                    self.input_sections[section] = not self.input_sections[section]
+                    return
 
             # Slot rows select active input target.
             if spec:
@@ -2089,13 +2546,21 @@ class App:
                 self.plot_panel.wheel(dy)
             elif self.builder_rect.collidepoint(pos):
                 self.builder_panel.wheel(dy)
-            elif self.options_rect.collidepoint(pos):
-                self.options_panel.wheel(dy)
 
     def handle_mouse_up(self, pos: Tuple[int, int], button: int):
         if self.rel_editor_open:
             self.handle_relationship_mouse_up(pos, button)
             return
+
+        if button == 1 and self.resizing_panel:
+            self.resizing_panel = None
+            return
+
+        if button == 1:
+            for rect, _, _, action in self.menu_buttons:
+                if rect.collidepoint(pos):
+                    self.handle_menu_action(action)
+                    return
 
         if button != 1 or not self.drag_item:
             return
@@ -2115,6 +2580,16 @@ class App:
         self.update_tooltip(pos)
 
         if self.rel_editor_open:
+            return
+
+        if self.resizing_panel and buttons[0]:
+            if self.resizing_panel == "left":
+                self.left_panel_w = max(260, min(pos[0] - 12, self.window_w - self.right_panel_w - 380))
+            elif self.resizing_panel == "right":
+                self.right_panel_w = max(240, min(self.window_w - pos[0] - 12, self.window_w - self.left_panel_w - 380))
+            elif self.resizing_panel == "middle":
+                self.builder_h = max(220, min(pos[1] - self.builder_rect.y - 4, self.window_h - 230))
+            self.update_layout()
             return
 
         if not self.drag_item or self.drag_item.kind != "column" or not buttons[0]:
@@ -2138,6 +2613,10 @@ class App:
 
         if event.key == pygame.K_F11:
             self.toggle_fullscreen()
+            return
+
+        if not self.input_target and event.key == pygame.K_RETURN:
+            self.calculate_plot()
             return
 
         if not self.input_target:
@@ -2190,7 +2669,7 @@ class App:
             self.draw_plot_type_panel()
             self.draw_builder_area()
             self.draw_chart_area()
-            self.draw_options_area()
+            self.draw_splitters()
             self.draw_status()
             self.draw_dragging()
             self.draw_menu_popup()
