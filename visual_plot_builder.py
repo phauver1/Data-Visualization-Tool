@@ -1307,20 +1307,36 @@ class App:
         tables = list(self.dataframes.keys())
         cols = max(1, min(4, len(tables)))
         card_w = max(220, (canvas.w - (cols + 1) * 14) // cols)
+        gap_y = 20
+        table_box_h: Dict[str, int] = {}
+        for t in tables:
+            # Full column list is rendered; canvas scrolling handles overflow.
+            table_box_h[t] = max(240, 42 + len(self.dataframes[t].columns) * 23 + 8)
         rows = max(1, math.ceil(max(1, len(tables)) / cols))
-        content_h = rows * 260 + 20
+        row_heights: List[int] = []
+        for r in range(rows):
+            row_tables = tables[r * cols : (r + 1) * cols]
+            row_heights.append(max([table_box_h[t] for t in row_tables], default=240))
+        content_h = sum(row_heights) + max(0, rows - 1) * gap_y + 28
         self.rel_scroll_max = max(0, content_h - canvas.h)
         self.rel_scroll_y = max(0, min(self.rel_scroll_y, self.rel_scroll_max))
         x0 = canvas.x + 14
         y0 = canvas.y + 14 - self.rel_scroll_y
         related_cols = self.get_related_column_set()
 
+        row_top_cache: Dict[int, int] = {}
+        running_y = y0
+        for r in range(rows):
+            row_top_cache[r] = running_y
+            running_y += row_heights[r] + gap_y
+
         for idx, table in enumerate(tables):
             c = idx % cols
             r = idx // cols
             x = x0 + c * (card_w + 14)
-            y = y0 + r * 260
-            box = pygame.Rect(x, y, card_w, 240)
+            y = row_top_cache.get(r, y0)
+            box_h = table_box_h.get(table, 240)
+            box = pygame.Rect(x, y, card_w, box_h)
             self.rel_table_boxes[table] = box
 
             pygame.draw.rect(self.screen, (50, 60, 76), box, border_radius=8)
@@ -1328,8 +1344,7 @@ class App:
             self.draw_text(self.clip_text(table, box.w - 10, self.font_sm), (box.x + 6, box.y + 6), font=self.font_sm)
 
             col_y = box.y + 30
-            max_rows = 9
-            for i, col in enumerate(self.dataframes[table].columns[:max_rows]):
+            for i, col in enumerate(self.dataframes[table].columns):
                 cr = pygame.Rect(box.x + 6, col_y, box.w - 12, 20)
                 pygame.draw.rect(self.screen, (72, 82, 100), cr, border_radius=4)
                 if (table, str(col)) in related_cols:
@@ -1337,8 +1352,6 @@ class App:
                 self.draw_text(self.clip_text(str(col), cr.w - 10, self.font_sm), (cr.x + 5, cr.y + 2), font=self.font_sm)
                 self.rel_column_boxes.append((cr, table, str(col)))
                 col_y += 23
-            if len(self.dataframes[table].columns) > max_rows:
-                self.draw_text("...", (box.x + box.w - 20, box.y + box.h - 20), MUTED, self.font_sm)
 
         # Draw existing relationship lines.
         for i, rel in enumerate(self.relationships):
@@ -1596,10 +1609,23 @@ class App:
         final_model.fit(X, y)
 
         imp = pd.Series(final_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
+        display_labels = []
+        seen: Dict[str, int] = {}
+        for full_name in imp.index.tolist():
+            table, col = full_name.split(".", 1) if "." in full_name else ("", full_name)
+            base = col
+            if base in seen:
+                seen[base] += 1
+                base = f"{col} ({table})"
+            else:
+                seen[base] = 1
+            display_labels.append(base)
 
         plt.close("all")
         fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
-        sns.barplot(x=imp.index.tolist(), y=imp.values.tolist(), ax=ax, color="#4da3ff")
+        ax.bar(range(len(imp)), imp.values.tolist(), color="#4da3ff")
+        ax.set_xticks(range(len(display_labels)))
+        ax.set_xticklabels(display_labels, rotation=35, ha="right")
         ax.tick_params(axis="x", rotation=35)
         ax.set_xlabel("Feature")
         ax.set_ylabel("Importance")
@@ -1630,13 +1656,16 @@ class App:
             self.status = "Dendrogram requires at least two feature columns."
             return
 
-        data = merged_df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+        data = merged_df[cols].apply(pd.to_numeric, errors="coerce")
+        data = data.replace([np.inf, -np.inf], np.nan).dropna()
         if len(data) < 2:
             self.status = "Dendrogram requires at least two complete numeric rows."
             return
 
-        method = self.option_values.get("method") or "ward"
-        metric = self.option_values.get("metric") or "euclidean"
+        method = str(self.option_values.get("method") or "ward")
+        metric = str(self.option_values.get("metric") or "euclidean")
+        if method == "ward" and metric != "euclidean":
+            metric = "euclidean"
         orientation = self.option_values.get("orientation") or "top"
         truncate_mode = self.option_values.get("truncate_mode")
         p = self.option_values.get("p")
@@ -1645,7 +1674,12 @@ class App:
 
         plt.close("all")
         fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
-        Z = linkage(data.values, method=method, metric=metric)
+        try:
+            Z = linkage(data.values, method=method, metric=metric)
+        except Exception as e:
+            self.status = f"Dendrogram failed during linkage: {e}"
+            plt.close(fig)
+            return
         dendrogram(
             Z,
             ax=ax,
