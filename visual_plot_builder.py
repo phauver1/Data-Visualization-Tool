@@ -1,3 +1,5 @@
+"""Primary visual plot builder application with rich interactive controls."""
+
 import ast
 import inspect
 import json
@@ -22,6 +24,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.manifold import TSNE
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
 
 try:
     from scipy.cluster.hierarchy import dendrogram, linkage
@@ -35,6 +39,13 @@ try:
 except Exception:  # pragma: no cover
     tk = None
     filedialog = None
+
+try:
+    from visual_plot_builder_common import COLUMN_TYPE_COLORS as SHARED_COLUMN_TYPE_COLORS
+    from visual_plot_builder_common import COLUMN_TYPE_PREFIX as SHARED_COLUMN_TYPE_PREFIX
+except Exception:  # pragma: no cover
+    SHARED_COLUMN_TYPE_COLORS = None
+    SHARED_COLUMN_TYPE_PREFIX = None
 
 
 # ------------------------------
@@ -65,6 +76,25 @@ REL_JOIN_COLORS = {
     "right": (225, 153, 88),
     "outer": (186, 123, 255),
 }
+
+COLUMN_TYPE_COLORS = {
+    "nominal": (241, 106, 95),
+    "ordinal": (244, 179, 80),
+    "interval": (109, 170, 255),
+    "ratio": (98, 210, 130),
+}
+
+COLUMN_TYPE_PREFIX = {
+    "nominal": "N: ",
+    "ordinal": "O: ",
+    "interval": "I: ",
+    "ratio": "R: ",
+}
+
+if SHARED_COLUMN_TYPE_COLORS:
+    COLUMN_TYPE_COLORS = SHARED_COLUMN_TYPE_COLORS
+if SHARED_COLUMN_TYPE_PREFIX:
+    COLUMN_TYPE_PREFIX = SHARED_COLUMN_TYPE_PREFIX
 
 
 # ------------------------------
@@ -110,6 +140,8 @@ COLUMN_PARAM_CANDIDATES = {
     "x_vars",
     "y_vars",
     "vars",
+    "feature_column",
+    "target_column",
 }
 
 GLOBAL_FIXED_OPTIONS: Dict[str, List[Any]] = {
@@ -224,6 +256,8 @@ PLOT_DESCRIPTIONS = {
     "parallel_lines": "Parallel coordinates plot for multiple features with optional class grouping.",
     "pca_plot": "PCA projection to two dimensions from selected feature columns.",
     "tsne_plot": "t-SNE projection to two dimensions from selected feature columns.",
+    "markov_chain": "Transition graph from feature value to target value with probability labels.",
+    "sankey_plot": "Flow graph from feature value to target value with widths proportional to counts.",
 }
 
 PARAM_DESCRIPTIONS = {
@@ -246,6 +280,8 @@ PARAM_DESCRIPTIONS = {
     "class_column": "Optional class/group column used for coloring/grouping.",
     "feature_columns": "Input feature columns.",
     "z": "Value column used for grid cell intensity.",
+    "feature_column": "Single feature column.",
+    "target_column": "Single target/output column.",
 }
 
 
@@ -254,6 +290,7 @@ PARAM_DESCRIPTIONS = {
 # ------------------------------
 @dataclass
 class PlotSpec:
+    """Description of a plot type including required/optional input configuration."""
     name: str
     description: str
     required_slots: List[str]
@@ -267,6 +304,7 @@ class PlotSpec:
 
 @dataclass
 class DragItem:
+    """Represents a currently dragged item in the UI."""
     kind: str  # "column"
     value: str
     table: Optional[str] = None
@@ -275,6 +313,7 @@ class DragItem:
 
 @dataclass
 class Relation:
+    """Relationship (join edge) between two table columns."""
     left_table: str
     left_col: str
     right_table: str
@@ -285,6 +324,7 @@ class Relation:
 
 @dataclass
 class TableSource:
+    """Metadata describing where table data is sourced from."""
     kind: str  # "memory" | "sqlite"
     name: str
     columns: List[str]
@@ -293,6 +333,7 @@ class TableSource:
 
 
 class ScrollPanel:
+    """Simple vertical scrolling state holder for a panel viewport."""
     def __init__(self, rect: pygame.Rect):
         self.rect = rect
         self.scroll_y = 0
@@ -311,6 +352,7 @@ class ScrollPanel:
 # Plot specification construction
 # ------------------------------
 def _build_seaborn_spec(plot_name: str) -> PlotSpec:
+    """Build a PlotSpec from a seaborn function signature."""
     fn = getattr(sns, plot_name)
     sig = inspect.signature(fn)
 
@@ -353,6 +395,7 @@ def _build_seaborn_spec(plot_name: str) -> PlotSpec:
 
 
 def build_plot_specs() -> Dict[str, PlotSpec]:
+    """Construct all supported plot specifications for the application."""
     specs: Dict[str, PlotSpec] = {}
 
     for plot_name in SEABORN_PLOT_FUNCS:
@@ -506,6 +549,30 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
         group="Seaborn Plots",
     )
 
+    specs["markov_chain"] = PlotSpec(
+        name="markov_chain",
+        description=PLOT_DESCRIPTIONS["markov_chain"],
+        required_slots=["feature_column", "target_column"],
+        column_slots=["feature_column", "target_column"],
+        multi_slots=set(),
+        option_params=[],
+        function_name=None,
+        custom=True,
+        group="Seaborn Plots",
+    )
+
+    specs["sankey_plot"] = PlotSpec(
+        name="sankey_plot",
+        description=PLOT_DESCRIPTIONS["sankey_plot"],
+        required_slots=["feature_column", "target_column"],
+        column_slots=["feature_column", "target_column"],
+        multi_slots=set(),
+        option_params=[],
+        function_name=None,
+        custom=True,
+        group="Seaborn Plots",
+    )
+
     return specs
 
 
@@ -513,6 +580,7 @@ def build_plot_specs() -> Dict[str, PlotSpec]:
 # App implementation
 # ------------------------------
 class App:
+    """Main Pygame application for interactive plot building and analysis."""
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Seaborn Visual Builder")
@@ -536,6 +604,7 @@ class App:
         self.table_sources: Dict[str, TableSource] = {}
         self.table_collapsed: Dict[str, bool] = {}
         self.data_layout: List[Tuple[pygame.Rect, str, str, str]] = []
+        self.data_col_ui: Dict[Tuple[str, str], Dict[str, pygame.Rect]] = {}
         self.plot_layout: List[Tuple[pygame.Rect, str, str]] = []  # (rect, kind, value)
         self.slot_layout: Dict[str, pygame.Rect] = {}
         self.option_layout: Dict[str, pygame.Rect] = {}
@@ -564,6 +633,14 @@ class App:
         self.status = "Load one or more CSV/Excel/SQLite files to begin."
 
         self.source_files: List[str] = []
+        self.column_types: Dict[str, str] = {}  # "table::col" -> nominal|ordinal|interval|ratio
+        self.ordinal_orders: Dict[str, List[str]] = {}  # "table::col" -> ordered category values
+
+        self.col_type_menu_target: Optional[Tuple[str, str]] = None
+        self.col_type_menu_rect: Optional[pygame.Rect] = None
+        self.col_type_menu_items: List[Tuple[pygame.Rect, str]] = []
+
+        self.last_cursor_key: Optional[str] = None
 
         # Relationship editor state.
         self.relationships: List[Relation] = []
@@ -840,6 +917,8 @@ class App:
             "option_values": self.option_values,
             "relationships": [asdict(r) for r in self.relationships],
             "plot_groups": self.plot_groups,
+            "column_types": self.column_types,
+            "ordinal_orders": self.ordinal_orders,
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -874,6 +953,8 @@ class App:
 
         self.slot_values = payload.get("slot_values", {})
         self.option_values = payload.get("option_values", {})
+        self.column_types = payload.get("column_types", {})
+        self.ordinal_orders = payload.get("ordinal_orders", {})
 
         rels = []
         for r in payload.get("relationships", []):
@@ -982,6 +1063,58 @@ class App:
             return "", value
         return value.split("::", 1)
 
+    def col_key(self, table: str, col: str) -> str:
+        return self.encode_col(table, col)
+
+    def get_column_type(self, table: str, col: str) -> str:
+        return self.column_types.get(self.col_key(table, col), "ratio")
+
+    def set_column_type(self, table: str, col: str, col_type: str):
+        key = self.col_key(table, col)
+        if col_type not in COLUMN_TYPE_COLORS:
+            return
+        self.column_types[key] = col_type
+        if col_type == "ordinal" and key not in self.ordinal_orders:
+            self.ordinal_orders[key] = self.default_ordinal_order(table, col)
+        if col_type != "ordinal":
+            self.ordinal_orders.pop(key, None)
+
+    def cycle_column_type(self, table: str, col: str):
+        order = ["ratio", "nominal", "ordinal", "interval"]
+        current = self.get_column_type(table, col)
+        idx = order.index(current) if current in order else 0
+        self.set_column_type(table, col, order[(idx + 1) % len(order)])
+
+    def default_ordinal_order(self, table: str, col: str) -> List[str]:
+        df = self.fetch_table_dataframe(table, [col])
+        vals = [str(v) for v in df[col].dropna().unique().tolist()] if col in df.columns else []
+        if not vals:
+            return []
+        numeric_pairs = []
+        all_numeric = True
+        for v in vals:
+            try:
+                numeric_pairs.append((float(v), v))
+            except Exception:
+                all_numeric = False
+                break
+        if all_numeric:
+            numeric_pairs.sort(key=lambda x: x[0])
+            return [v for _, v in numeric_pairs]
+        return sorted(vals, key=lambda x: x.lower())
+
+    def set_cursor_style(self, cursor_key: str):
+        if self.last_cursor_key == cursor_key:
+            return
+        cursor_map = {
+            "arrow": pygame.SYSTEM_CURSOR_ARROW,
+            "hresize": pygame.SYSTEM_CURSOR_SIZEWE,
+            "vresize": pygame.SYSTEM_CURSOR_SIZENS,
+            "hand": pygame.SYSTEM_CURSOR_HAND,
+        }
+        pygame.mouse.set_cursor(pygame.cursors.Cursor(cursor_map.get(cursor_key, pygame.SYSTEM_CURSOR_ARROW)))
+        self.last_cursor_key = cursor_key
+
     def is_column_selected_in_active_slot(self, table: str, col: str) -> bool:
         spec = self.current_spec()
         if not spec or not self.active_slot:
@@ -1020,7 +1153,6 @@ class App:
                         if e not in existing:
                             existing.append(e)
                 self.slot_values[slot] = existing
-                self.chart_surface = None
                 self.status = f"Updated range selection for {slot}"
                 self.last_multi_anchor = (table, col)
                 return
@@ -1037,7 +1169,6 @@ class App:
             self.status = f"Selected {table}.{col} for {slot}"
 
         self.last_multi_anchor = (table, col)
-        self.chart_surface = None
 
     def clear_plot_state(self):
         spec = self.current_spec()
@@ -1055,7 +1186,6 @@ class App:
     def select_plot(self, plot_name: str):
         self.selected_plot = plot_name
         self.clear_plot_state()
-        self.chart_surface = None
         self.close_menu()
         self.close_input_dialog()
         self.status = f"Selected plot: {plot_name}"
@@ -1090,6 +1220,7 @@ class App:
         pygame.draw.rect(self.screen, PANEL_ALT, viewport, border_radius=6)
 
         self.data_layout = []
+        self.data_col_ui = {}
         y = viewport.y + 8 - self.data_panel.scroll_y
         row_h = 28
         col_h = 22
@@ -1115,8 +1246,21 @@ class App:
                         pygame.draw.rect(self.screen, (70, 78, 92), c_rect, border_radius=5)
                         if spec and self.active_slot and self.is_column_selected_in_active_slot(table, str(col)):
                             pygame.draw.rect(self.screen, ACCENT, c_rect, width=2, border_radius=5)
-                        c_text = self.clip_text(str(col), c_rect.w - 10, self.font_sm)
-                        self.draw_text(c_text, (c_rect.x + 6, c_rect.y + 3), font=self.font_sm)
+                        col_type = self.get_column_type(table, str(col))
+                        type_color = COLUMN_TYPE_COLORS[col_type]
+                        prefix = COLUMN_TYPE_PREFIX[col_type]
+                        corner = pygame.Rect(c_rect.x + 2, c_rect.y + 2, 8, 8)
+                        pygame.draw.rect(self.screen, type_color, corner, border_radius=2)
+                        prefix_rect = pygame.Rect(c_rect.x + 14, c_rect.y + 1, 28, c_rect.h - 2)
+                        prefix_surf = self.font_sm.render(prefix, True, type_color)
+                        self.screen.blit(prefix_surf, (prefix_rect.x, prefix_rect.y + 1))
+                        c_text = self.clip_text(str(col), c_rect.w - 42, self.font_sm)
+                        self.draw_text(c_text, (c_rect.x + 40, c_rect.y + 3), font=self.font_sm)
+                        self.data_col_ui[(table, str(col))] = {
+                            "corner": corner,
+                            "prefix": prefix_rect,
+                            "box": c_rect,
+                        }
                     self.data_layout.append((c_rect, "column", table, str(col)))
                     y += col_h + 3
 
@@ -1402,6 +1546,43 @@ class App:
         pygame.draw.rect(self.screen, ACCENT, field, width=1, border_radius=6)
         self.draw_text(self.clip_text(self.input_value, field.w - 10, self.font_sm), (field.x + 8, field.y + 8), font=self.font_sm)
 
+    def open_col_type_menu(self, table: str, col: str, pos: Tuple[int, int]):
+        self.col_type_menu_target = (table, col)
+        self.col_type_menu_rect = pygame.Rect(pos[0], pos[1], 210, 170)
+        if self.col_type_menu_rect.right > self.window_w - 8:
+            self.col_type_menu_rect.x = self.window_w - self.col_type_menu_rect.w - 8
+        if self.col_type_menu_rect.bottom > self.window_h - 8:
+            self.col_type_menu_rect.y = self.window_h - self.col_type_menu_rect.h - 8
+        self.col_type_menu_items = []
+
+    def close_col_type_menu(self):
+        self.col_type_menu_target = None
+        self.col_type_menu_rect = None
+        self.col_type_menu_items = []
+
+    def draw_col_type_menu(self):
+        if not self.col_type_menu_target or not self.col_type_menu_rect:
+            return
+        table, col = self.col_type_menu_target
+        rect = self.col_type_menu_rect
+        pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
+        pygame.draw.rect(self.screen, (255, 255, 255), rect, width=1, border_radius=8)
+        self.draw_text(self.clip_text(f"{table}.{col}", rect.w - 10, self.font_sm), (rect.x + 6, rect.y + 6), MUTED, self.font_sm)
+        self.col_type_menu_items = []
+        y = rect.y + 30
+        for t in ["nominal", "ordinal", "interval", "ratio"]:
+            r = pygame.Rect(rect.x + 8, y, rect.w - 16, 26)
+            pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=5)
+            color = COLUMN_TYPE_COLORS[t]
+            self.draw_text(COLUMN_TYPE_PREFIX[t] + t.title(), (r.x + 6, r.y + 5), color, self.font_sm)
+            self.col_type_menu_items.append((r, f"type::{t}"))
+            y += 30
+        if self.get_column_type(table, col) == "ordinal":
+            r = pygame.Rect(rect.x + 8, y, rect.w - 16, 26)
+            pygame.draw.rect(self.screen, (58, 66, 82), r, border_radius=5)
+            self.draw_text("Set Ordinal Order...", (r.x + 6, r.y + 5), ACCENT, self.font_sm)
+            self.col_type_menu_items.append((r, "set_order"))
+
     # ------------------------------
     # Relationship editor modal
     # ------------------------------
@@ -1611,7 +1792,7 @@ class App:
             self.slot_values[slot] = encoded[0]
             self.status = f"Assigned {table}.{columns[0]} to {slot}"
 
-        self.chart_surface = None
+        # Keep previous rendered chart until user explicitly recalculates.
 
     def gather_used_tables(self, spec: PlotSpec) -> Set[str]:
         used: Set[str] = set()
@@ -1844,7 +2025,7 @@ class App:
                 self.status = f"RF column not found after join: {c}"
                 return
 
-        X = merged_df[feature_cols]
+        X = merged_df[feature_cols].copy()
         y = merged_df[target_col]
 
         valid = X.notna().all(axis=1) & y.notna()
@@ -1856,6 +2037,43 @@ class App:
             return
 
         model_kwargs = {k: v for k, v in self.option_values.items() if v is not None}
+
+        nominal_cols: List[str] = []
+        ordinal_cols: List[str] = []
+        numeric_cols: List[str] = []
+        ordinal_categories: List[List[str]] = []
+        for full_col in feature_cols:
+            table, col = full_col.split(".", 1) if "." in full_col else ("", full_col)
+            ctype = self.get_column_type(table, col) if table else "ratio"
+            if ctype == "nominal":
+                nominal_cols.append(full_col)
+            elif ctype == "ordinal":
+                ordinal_cols.append(full_col)
+                ord_vals = self.ordinal_orders.get(self.col_key(table, col), [])
+                if not ord_vals:
+                    ord_vals = self.default_ordinal_order(table, col)
+                ordinal_categories.append([str(v) for v in ord_vals] if ord_vals else sorted([str(v) for v in X[full_col].dropna().unique().tolist()]))
+            else:
+                numeric_cols.append(full_col)
+
+        transformers = []
+        if nominal_cols:
+            transformers.append(("nominal", OneHotEncoder(handle_unknown="ignore"), nominal_cols))
+        if ordinal_cols:
+            transformers.append(
+                (
+                    "ordinal",
+                    OrdinalEncoder(
+                        categories=ordinal_categories,
+                        handle_unknown="use_encoded_value",
+                        unknown_value=-1,
+                    ),
+                    ordinal_cols,
+                )
+            )
+        if numeric_cols:
+            transformers.append(("numeric", "passthrough", numeric_cols))
+        pre = ColumnTransformer(transformers=transformers, remainder="drop")
 
         try:
             bins = pd.qcut(y, q=5, labels=False, duplicates="drop")
@@ -1871,14 +2089,40 @@ class App:
 
         scores: List[float] = []
         for tr, te in folds:
+            pre_fold = pre
+            X_train = X.iloc[tr].copy()
+            X_test = X.iloc[te].copy()
+            for c in numeric_cols:
+                X_train[c] = pd.to_numeric(X_train[c], errors="coerce")
+                X_test[c] = pd.to_numeric(X_test[c], errors="coerce")
+            X_train_enc = pre_fold.fit_transform(X_train)
+            X_test_enc = pre_fold.transform(X_test)
             m = RandomForestRegressor(**model_kwargs)
-            m.fit(X.iloc[tr], y.iloc[tr])
-            scores.append(float(m.score(X.iloc[te], y.iloc[te])))
+            m.fit(X_train_enc, y.iloc[tr])
+            scores.append(float(m.score(X_test_enc, y.iloc[te])))
 
         final_model = RandomForestRegressor(**model_kwargs)
-        final_model.fit(X, y)
+        X_fit = X.copy()
+        for c in numeric_cols:
+            X_fit[c] = pd.to_numeric(X_fit[c], errors="coerce")
+        X_enc = pre.fit_transform(X_fit)
+        final_model.fit(X_enc, y)
 
-        imp = pd.Series(final_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
+        try:
+            transformed_names = list(pre.get_feature_names_out())
+        except Exception:
+            transformed_names = [f"f{i}" for i in range(len(final_model.feature_importances_))]
+        agg_imp: Dict[str, float] = {c: 0.0 for c in feature_cols}
+        for n, v in zip(transformed_names, final_model.feature_importances_):
+            matched = None
+            for c in feature_cols:
+                if c in n:
+                    matched = c
+                    break
+            if matched is None:
+                matched = feature_cols[0]
+            agg_imp[matched] += float(v)
+        imp = pd.Series(agg_imp).sort_values(ascending=False)
         display_labels = []
         seen: Dict[str, int] = {}
         for full_name in imp.index.tolist():
@@ -2224,6 +2468,116 @@ class App:
         plt.close(fig)
         self.status = "tsne_plot generated successfully."
 
+    def _validate_categorical_column_for_flow(self, table_col: str) -> bool:
+        table, col = table_col.split(".", 1) if "." in table_col else ("", table_col)
+        ctype = self.get_column_type(table, col) if table else "ratio"
+        return ctype in {"nominal", "ordinal"}
+
+    def _calculate_markov_chain(self, merged_df: pd.DataFrame):
+        f_col = self._resolve_single_slot_column(merged_df, "feature_column")
+        t_col = self._resolve_single_slot_column(merged_df, "target_column")
+        if not f_col or not t_col:
+            self.status = "markov_chain requires feature_column and target_column."
+            return
+        if not self._validate_categorical_column_for_flow(f_col) or not self._validate_categorical_column_for_flow(t_col):
+            self.status = "markov_chain requires nominal or ordinal columns."
+            return
+
+        data = merged_df[[f_col, t_col]].dropna()
+        if data.empty:
+            self.status = "markov_chain has no complete rows."
+            return
+        prob = pd.crosstab(data[f_col], data[t_col], normalize="index")
+        features = [str(v) for v in prob.index.tolist()]
+        targets = [str(v) for v in prob.columns.tolist()]
+
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        ax.set_axis_off()
+
+        fx = 0.15
+        tx = 0.85
+        fpos = {v: 0.1 + i * (0.8 / max(1, len(features) - 1)) for i, v in enumerate(features)}
+        tpos = {v: 0.1 + i * (0.8 / max(1, len(targets) - 1)) for i, v in enumerate(targets)}
+
+        for v, y in fpos.items():
+            ax.text(fx, y, v, transform=ax.transAxes, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.2", fc="#44506a", ec="white"))
+        for v, y in tpos.items():
+            ax.text(tx, y, v, transform=ax.transAxes, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.2", fc="#4e5f80", ec="white"))
+
+        for fv in features:
+            for tv in targets:
+                p = float(prob.loc[fv, tv])
+                if p <= 0:
+                    continue
+                ax.annotate(
+                    f"{p * 100:.1f}%",
+                    xy=(tx - 0.04, tpos[tv]),
+                    xytext=(fx + 0.04, fpos[fv]),
+                    xycoords=ax.transAxes,
+                    textcoords=ax.transAxes,
+                    arrowprops=dict(arrowstyle="->", color="#9ec2ff", lw=1.5),
+                    fontsize=7,
+                    color="white",
+                )
+        ax.set_title("Markov Chain Feature -> Target")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "markov_chain generated successfully."
+
+    def _calculate_sankey_plot(self, merged_df: pd.DataFrame):
+        f_col = self._resolve_single_slot_column(merged_df, "feature_column")
+        t_col = self._resolve_single_slot_column(merged_df, "target_column")
+        if not f_col or not t_col:
+            self.status = "sankey_plot requires feature_column and target_column."
+            return
+        if not self._validate_categorical_column_for_flow(f_col) or not self._validate_categorical_column_for_flow(t_col):
+            self.status = "sankey_plot requires nominal or ordinal columns."
+            return
+
+        data = merged_df[[f_col, t_col]].dropna()
+        if data.empty:
+            self.status = "sankey_plot has no complete rows."
+            return
+        cnt = pd.crosstab(data[f_col], data[t_col])
+        features = [str(v) for v in cnt.index.tolist()]
+        targets = [str(v) for v in cnt.columns.tolist()]
+        max_flow = max(1, int(cnt.values.max()))
+
+        plt.close("all")
+        fig, ax = plt.subplots(figsize=(8, 3.2), dpi=120)
+        ax.set_axis_off()
+        fx = 0.15
+        tx = 0.85
+        fpos = {v: 0.1 + i * (0.8 / max(1, len(features) - 1)) for i, v in enumerate(features)}
+        tpos = {v: 0.1 + i * (0.8 / max(1, len(targets) - 1)) for i, v in enumerate(targets)}
+
+        for v, y in fpos.items():
+            ax.text(fx, y, v, transform=ax.transAxes, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.2", fc="#44506a", ec="white"))
+        for v, y in tpos.items():
+            ax.text(tx, y, v, transform=ax.transAxes, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.2", fc="#4e5f80", ec="white"))
+
+        for fv in features:
+            for tv in targets:
+                c = int(cnt.loc[fv, tv])
+                if c <= 0:
+                    continue
+                lw = 1.0 + 10.0 * (c / max_flow)
+                ax.annotate(
+                    "",
+                    xy=(tx - 0.05, tpos[tv]),
+                    xytext=(fx + 0.05, fpos[fv]),
+                    xycoords=ax.transAxes,
+                    textcoords=ax.transAxes,
+                    arrowprops=dict(arrowstyle="-", color="#8eb5ff", lw=lw, alpha=0.55),
+                )
+        ax.set_title("Sankey Feature -> Target Flow")
+        fig.tight_layout()
+        self.chart_surface = self._render_figure_to_surface(fig)
+        plt.close(fig)
+        self.status = "sankey_plot generated successfully."
+
     def calculate_plot(self):
         spec = self.current_spec()
         if not spec:
@@ -2268,6 +2622,12 @@ class App:
                 if spec.name == "tsne_plot":
                     self._calculate_tsne_plot(merged_df)
                     return
+                if spec.name == "markov_chain":
+                    self._calculate_markov_chain(merged_df)
+                    return
+                if spec.name == "sankey_plot":
+                    self._calculate_sankey_plot(merged_df)
+                    return
 
             kwargs = self._collect_seaborn_kwargs(spec, merged_df)
             if kwargs is None:
@@ -2309,6 +2669,8 @@ class App:
             self.table_collapsed = {}
             self.relationships = []
             self.source_files = []
+            self.column_types = {}
+            self.ordinal_orders = {}
         self.status = "Cleared current selection."
 
     # ------------------------------
@@ -2449,7 +2811,37 @@ class App:
             self.handle_relationship_mouse_down(pos, button)
             return
 
+        if button == 3:
+            # Right-click opens per-column type menu.
+            for (table, col), ui in self.data_col_ui.items():
+                if ui["box"].collidepoint(pos):
+                    self.open_col_type_menu(table, col, pos)
+                    return
+            self.close_col_type_menu()
+            return
+
         if button == 1:
+            if self.col_type_menu_target and self.col_type_menu_rect:
+                for r, action in self.col_type_menu_items:
+                    if r.collidepoint(pos):
+                        table, col = self.col_type_menu_target
+                        if action.startswith("type::"):
+                            self.set_column_type(table, col, action.split("::", 1)[1])
+                            self.status = f"Set {table}.{col} type to {self.get_column_type(table, col)}"
+                            self.close_col_type_menu()
+                            return
+                        if action == "set_order":
+                            key = self.col_key(table, col)
+                            current = self.ordinal_orders.get(key) or self.default_ordinal_order(table, col)
+                            self.input_target = (f"ordinal::{table}::{col}", False)
+                            self.input_rect = pygame.Rect(self.builder_rect.centerx - 260, self.builder_rect.centery - 70, 520, 130)
+                            self.input_value = ",".join(current)
+                            self.close_col_type_menu()
+                            return
+                if not self.col_type_menu_rect.collidepoint(pos):
+                    self.close_col_type_menu()
+                return
+
             if self.left_splitter.collidepoint(pos):
                 self.resizing_panel = "left"
                 return
@@ -2468,7 +2860,6 @@ class App:
                             self.option_values[name] = val
                         else:
                             self.slot_values[name] = val
-                        self.chart_surface = None
                         self.status = f"Set {name} = {val}"
                         self.close_menu()
                         return
@@ -2491,7 +2882,7 @@ class App:
             # Slot rows select active input target.
             if spec:
                 for slot, rect in self.slot_layout.items():
-                    if rect.collidepoint(pos):
+                    if self.builder_panel.rect.collidepoint(pos) and rect.collidepoint(pos):
                         if self.active_slot != slot:
                             self.last_multi_anchor = None
                         self.active_slot = slot
@@ -2500,7 +2891,7 @@ class App:
 
                 # Optional param rows open fixed-choice menu or typed dialog.
                 for opt, rect in self.option_layout.items():
-                    if rect.collidepoint(pos):
+                    if self.builder_panel.rect.collidepoint(pos) and rect.collidepoint(pos):
                         default = self.option_default(spec.name, opt)
                         fixed = self.fixed_options_for(spec.name, opt, default)
                         if fixed:
@@ -2511,11 +2902,16 @@ class App:
 
             # Data interactions.
             for rect, kind, table, col in self.data_layout:
-                if rect.collidepoint(pos):
+                if self.data_panel.rect.collidepoint(pos) and rect.collidepoint(pos):
                     if kind == "header":
                         self.table_collapsed[table] = not self.table_collapsed.get(table, False)
                         return
                     if kind == "column":
+                        ui = self.data_col_ui.get((table, col))
+                        if ui and (ui["corner"].collidepoint(pos) or ui["prefix"].collidepoint(pos)):
+                            self.cycle_column_type(table, col)
+                            self.status = f"Set {table}.{col} type to {self.get_column_type(table, col)}"
+                            return
                         if spec and self.active_slot:
                             mods = pygame.key.get_mods()
                             ctrl = bool(mods & pygame.KMOD_CTRL)
@@ -2531,7 +2927,7 @@ class App:
 
             # Plot panel interactions.
             for rect, kind, value in self.plot_layout:
-                if rect.collidepoint(pos):
+                if self.plot_panel.rect.collidepoint(pos) and rect.collidepoint(pos):
                     if kind == "group":
                         self.plot_groups[value]["collapsed"] = not self.plot_groups[value]["collapsed"]
                     elif kind == "plot":
@@ -2592,6 +2988,15 @@ class App:
             self.update_layout()
             return
 
+        if self.left_splitter.collidepoint(pos) or self.right_splitter.collidepoint(pos):
+            self.set_cursor_style("hresize")
+        elif self.middle_splitter.collidepoint(pos):
+            self.set_cursor_style("vresize")
+        elif any(r.collidepoint(pos) for r, _, _, _ in self.menu_buttons):
+            self.set_cursor_style("hand")
+        else:
+            self.set_cursor_style("arrow")
+
         if not self.drag_item or self.drag_item.kind != "column" or not buttons[0]:
             return
 
@@ -2627,13 +3032,19 @@ class App:
             return
         if event.key == pygame.K_RETURN:
             name, is_option = self.input_target
-            parsed = self.parse_input_value(self.input_value)
-            if is_option:
-                self.option_values[name] = parsed
+            if name.startswith("ordinal::"):
+                _, table, col = name.split("::", 2)
+                vals = [v.strip() for v in self.input_value.split(",") if v.strip()]
+                self.set_column_type(table, col, "ordinal")
+                self.ordinal_orders[self.col_key(table, col)] = vals
+                self.status = f"Set ordinal order for {table}.{col}"
             else:
-                self.slot_values[name] = parsed
-            self.chart_surface = None
-            self.status = f"Set {name} = {parsed}"
+                parsed = self.parse_input_value(self.input_value)
+                if is_option:
+                    self.option_values[name] = parsed
+                else:
+                    self.slot_values[name] = parsed
+                self.status = f"Set {name} = {parsed}"
             self.close_input_dialog()
             return
         if event.key == pygame.K_BACKSPACE:
@@ -2674,6 +3085,7 @@ class App:
             self.draw_dragging()
             self.draw_menu_popup()
             self.draw_input_dialog()
+            self.draw_col_type_menu()
             self.draw_relationship_editor()
             self.draw_tooltip(pygame.mouse.get_pos())
 
